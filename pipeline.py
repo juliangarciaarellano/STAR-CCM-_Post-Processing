@@ -6,15 +6,7 @@
 --------------------------------------------------------------------------------
   Slice, interpolate and compare STAR-CCM+ EnSight Gold exports.
   Do not distribute without permission.
-
-pipeline.py
-===========
-Main orchestration — called by the CLI or GUI.
-
-run_pipeline(scalars=None, axes=None, geom_case=None, data_case=None,
-             output_dir=None, resolution_mm=None)
-
-Processes all requested scalars and axes, producing PNG + NPZ output.
+================================================================================
 """
 
 import os
@@ -51,13 +43,41 @@ def _extract_plane_jobs(cfd_mesh, scalars_to_run, axes_to_run):
         b = cfd_mesh[block_idx]
         if b is None or b.n_cells == 0:
             continue
-        ax = cfg.BLOCK_AXIS[block_idx]
-        if cfg.AXIS_LABEL[ax] not in axes_to_run:
-            continue
-        ha, va = cfg.PLOT_AXES[ax]
 
         cc   = b.cell_centers()
         pts  = cc.points
+
+        # ── Auto-detect the constant (slicing) axis ───────────────────────────
+        # The slicing axis is the one with fewest unique coordinate values.
+        # We also check the block name as a hint, but the data takes precedence.
+        n_unique = [len(np.unique(np.round(pts[:, a], 5))) for a in range(3)]
+        detected_ax = int(np.argmin(n_unique))
+
+        # Block name hint — check if name contains X/Y/Z
+        block_name = cfd_mesh.get_block_name(block_idx).strip().upper()
+        hint_ax = None
+        for a, label in [(0,'X'),(1,'Y'),(2,'Z')]:
+            if label in block_name:
+                hint_ax = a
+                break
+
+        # Use detected axis; warn if it disagrees with the name hint
+        ax = detected_ax
+        if hint_ax is not None and hint_ax != detected_ax:
+            log(f"  [WARN] Block {block_idx} ('{cfd_mesh.get_block_name(block_idx).strip()}'): "
+                f"name suggests axis {cfg.AXIS_LABEL[hint_ax]} but data is constant in "
+                f"{cfg.AXIS_LABEL[detected_ax]} "
+                f"(unique counts X={n_unique[0]:,} Y={n_unique[1]:,} Z={n_unique[2]:,}) "
+                f"— using detected axis {cfg.AXIS_LABEL[detected_ax]}")
+        elif hint_ax is None:
+            log(f"  [INFO] Block {block_idx} ('{cfd_mesh.get_block_name(block_idx).strip()}'): "
+                f"no axis hint in name, detected axis {cfg.AXIS_LABEL[detected_ax]} "
+                f"(unique counts X={n_unique[0]:,} Y={n_unique[1]:,} Z={n_unique[2]:,})")
+
+        ha, va = cfg.PLOT_AXES[ax]
+
+        if cfg.AXIS_LABEL[ax] not in axes_to_run:
+            continue
 
         # Collect arrays for all requested scalars.
         # First try exact match, then fall back to partial/substring match
@@ -87,10 +107,28 @@ def _extract_plane_jobs(cfd_mesh, scalars_to_run, axes_to_run):
         if not scalar_vals:
             continue
 
-        unique = np.unique(np.round(pts[:, ax], 6))
-        axis_bounds = {0: (-0.95, 1.98), 1: (-0.80, 0.80), 2: (-0.05, 1.22)}
-        lo, hi = axis_bounds[ax]
-        unique = unique[(unique >= lo) & (unique <= hi)]
+        unique = np.unique(np.round(pts[:, ax], 5))
+
+        # Filter planes to car region using CAR_BOUNDS_2D
+        # For each slice axis, the slicing coordinate range is
+        # the extent of the OTHER two axes' bounds
+        # e.g. X-slice: X range derived from Y-slice h_min/h_max isn't right —
+        # use a dedicated per-axis range based on geometry bounds
+        car_extent = {
+            0: (cfg.CAR_BOUNDS_2D[1][0], cfg.CAR_BOUNDS_2D[1][1]),  # X: from Y-slice h range
+            1: (cfg.CAR_BOUNDS_2D[0][0], cfg.CAR_BOUNDS_2D[0][1]),  # Y: from X-slice h range
+            2: (cfg.CAR_BOUNDS_2D[0][2], cfg.CAR_BOUNDS_2D[0][3]),  # Z: from X-slice v range
+        }
+        lo, hi = car_extent[ax]
+        unique_filtered = unique[(unique >= lo) & (unique <= hi)]
+
+        if len(unique_filtered) == 0:
+            log(f"  [WARN] Block {block_idx} axis {cfg.AXIS_LABEL[ax]}: "
+                f"all {len(unique)} planes outside car bounds [{lo:.3f}, {hi:.3f}]m — "
+                f"data range [{unique.min():.3f}, {unique.max():.3f}]m. "
+                f"Check CAR_BOUNDS_2D in Settings.")
+            continue
+        unique = unique_filtered
 
         log(f"  Block {block_idx} (axis {cfg.AXIS_LABEL[ax]}): "
             f"{len(unique)} planes  scalars={list(scalar_vals.keys())}")

@@ -80,6 +80,9 @@ def cmd_compare(args):
         output_dir = args.out     or None,
         label_a    = args.label_a,
         label_b    = args.label_b,
+        log_a      = args.log_a   or None,
+        log_b      = args.log_b   or None,
+        images     = not args.no_images,
     )
 
 
@@ -163,6 +166,13 @@ def build_parser():
                        help='Label for DIR_A in plots')
     p_cmp.add_argument('--label-b', default='Run B',
                        help='Label for DIR_B in plots')
+    p_cmp.add_argument('--log-a', metavar='PATH',
+                       help='STAR-CCM+ .log for DIR_A (enables aero report)')
+    p_cmp.add_argument('--log-b', metavar='PATH',
+                       help='STAR-CCM+ .log for DIR_B (enables aero report)')
+    p_cmp.add_argument('--no-images', action='store_true',
+                       help='Skip plane-image/NPZ diffing. Use with --log-a/--log-b '
+                            'to produce an aero (job) comparison on its own.')
 
     # ── info ──────────────────────────────────────────────────────
     p_info = sub.add_parser('info',

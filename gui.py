@@ -406,6 +406,11 @@ class CompareTab(ScrollableFrame):
             .grid(row=r, column=1, sticky="w", padx=PAD, pady=PAD_SM); r += 1
 
         section_label(f, "Aero Report  (optional)", r); r += 2
+        self.v_images = tk.BooleanVar(value=True)
+        tk.Checkbutton(f,
+                       text="Compute plane image comparison (delta PNGs + CSV)",
+                       variable=self.v_images, font=FONT, bg=BG)\
+            .grid(row=r, column=0, columnspan=2, sticky="w", padx=PAD); r += 1
         self.v_aero = tk.BooleanVar(value=False)
         tk.Checkbutton(f,
                        text="Generate aero delta report from .log files",
@@ -520,11 +525,16 @@ class CompareTab(ScrollableFrame):
                                  "Figure height and DPI must be numbers."); return
         delta_ranges = self._get_delta_ranges()
         if delta_ranges is None: return
+        do_images = self.v_images.get()
         log_a = self.v_log_a.get().strip() or None
         log_b = self.v_log_b.get().strip() or None
         if self.v_aero.get() and (not log_a or not log_b):
             messagebox.showwarning("Missing log files",
                 "Provide both log files or uncheck 'Generate aero report'.")
+            return
+        if not do_images and not self.v_aero.get():
+            messagebox.showwarning("Nothing to do",
+                "Enable image comparison, the aero report, or both.")
             return
         out_dir = self.v_out.get().strip() or None
         self.status_lbl.config(text="Running...", fg=ACCENT)
@@ -543,6 +553,7 @@ class CompareTab(ScrollableFrame):
                     log_b=log_b if self.v_aero.get() else None,
                     fig_height=figh, dpi=dpi,
                     delta_ranges=delta_ranges,
+                    images=do_images,
                 )
                 self.status_lbl.config(text="Done", fg="#2E7D32")
             except Exception as exc:
@@ -850,9 +861,9 @@ class SurfaceTab(ScrollableFrame):
         tk.Label(f, text="Scalar", font=FONT, bg=BG, anchor="w")\
             .grid(row=r, column=0, sticky="w", padx=PAD, pady=PAD_SM)
         self.v_scalar = tk.StringVar(
-            value=list(cfg.SCALARS.keys())[0] if cfg.SCALARS else '')
+            value=list(cfg.SURFACE_SCALARS.keys())[0] if cfg.SURFACE_SCALARS else '')
         self.scalar_menu = ttk.Combobox(f, textvariable=self.v_scalar,
-                                         values=list(cfg.SCALARS.keys()),
+                                         values=list(cfg.SURFACE_SCALARS.keys()),
                                          width=20, state='readonly')
         self.scalar_menu.grid(row=r, column=1, sticky="w",
                               padx=PAD, pady=PAD_SM); r += 1
@@ -980,47 +991,37 @@ class SurfaceTab(ScrollableFrame):
             .grid(row=r, column=0, columnspan=3, sticky="w",
                   padx=PAD, pady=PAD_SM); r += 1
 
+        # Interactive delta-HTML output + quality (shares A/B/labels/range above)
+        self.v_delta_html_out = tk.StringVar()
+        labeled_entry(f, "Delta .html file (optional)", self.v_delta_html_out, r,
+                      browse=lambda: self.v_delta_html_out.set(
+                          filedialog.asksaveasfilename(
+                              defaultextension=".html",
+                              filetypes=[("HTML files", "*.html")],
+                              initialfile="surface_delta_Cp.html"))); r += 1
+
+        tk.Label(f, text="Delta HTML quality", font=FONT, bg=BG, anchor="w")\
+            .grid(row=r, column=0, sticky="w", padx=PAD, pady=PAD_SM)
+        dqf = tk.Frame(f, bg=BG)
+        dqf.grid(row=r, column=1, sticky="w", padx=PAD)
+        self.v_delta_html_quality = tk.StringVar(value="medium")
+        for i, (lbl, val) in enumerate([
+            ("Low", "low"), ("Medium", "medium"), ("High", "high")]):
+            tk.Radiobutton(dqf, text=lbl, variable=self.v_delta_html_quality,
+                           value=val, font=FONT, bg=BG)\
+                .grid(row=0, column=i, padx=PAD)
+        r += 1
+
         bf2 = tk.Frame(f, bg=BG)
         bf2.grid(row=r, column=0, columnspan=3, pady=PAD, padx=PAD, sticky="e")
-        tk.Button(bf2, text="Render Delta", command=self._run_delta,
+        tk.Button(bf2, text="Delta HTML", command=self._run_delta_html,
+                  bg="#7B1FA2", fg="white", font=FONT_B,
+                  relief="flat", padx=12, pady=6, cursor="hand2")\
+            .pack(side="right", padx=(PAD_SM, 0))
+        tk.Button(bf2, text="Render Delta PNG", command=self._run_delta,
                   **BTN_RUN).pack(side="right")
         self.status_delta = tk.Label(bf2, text="", font=FONT, bg=BG, fg="#555")
         self.status_delta.pack(side="right", padx=PAD); r += 1
-
-        # ── 3D Export ─────────────────────────────────────────────
-        section_label(f, "3D Export", r); r += 2
-        self.v_export_out = tk.StringVar()
-        labeled_entry(f, "Output directory", self.v_export_out, r,
-                      browse=lambda: browse_dir(self.v_export_out)); r += 1
-
-        tk.Label(f, text="Format", font=FONT, bg=BG, anchor="w")\
-            .grid(row=r, column=0, sticky="w", padx=PAD, pady=PAD_SM)
-        fmt_frame = tk.Frame(f, bg=BG)
-        fmt_frame.grid(row=r, column=1, sticky="w", padx=PAD)
-        self.v_fmt = tk.StringVar(value="vtp")
-        for i, (label, val) in enumerate([
-            ("VTP — scalars preserved, ParaView", "vtp"),
-            ("VTK — scalars preserved",           "vtk"),
-            ("STL — geometry only, universal",    "stl"),
-            ("PLY — geometry only, compact",      "ply"),
-            ("OBJ — geometry only, universal",    "obj"),
-        ]):
-            tk.Radiobutton(fmt_frame, text=label, variable=self.v_fmt,
-                           value=val, font=FONT, bg=BG)\
-                .grid(row=i, column=0, sticky="w", padx=PAD_SM)
-        r += 6
-
-        self.v_merged = tk.BooleanVar(value=False)
-        tk.Checkbutton(f, text="Merge all parts into one file",
-                       variable=self.v_merged, font=FONT, bg=BG)\
-            .grid(row=r, column=0, columnspan=2, sticky="w", padx=PAD); r += 1
-
-        bf3 = tk.Frame(f, bg=BG)
-        bf3.grid(row=r, column=0, columnspan=3, pady=PAD, padx=PAD, sticky="e")
-        tk.Button(bf3, text="Export 3D", command=self._run_export,
-                  **BTN_RUN).pack(side="right")
-        self.status_export = tk.Label(bf3, text="", font=FONT, bg=BG, fg="#555")
-        self.status_export.pack(side="right", padx=PAD); r += 1
 
         # ── Interactive HTML export ───────────────────────────────
         section_label(f, "Interactive HTML  (open in any browser)", r); r += 2
@@ -1045,9 +1046,9 @@ class SurfaceTab(ScrollableFrame):
         qf.grid(row=r, column=1, sticky="w", padx=PAD)
         self.v_html_quality = tk.StringVar(value="medium")
         for i, (lbl, val, tip) in enumerate([
-            ("Low  (~5MB, fast)",    "low",    "20k tris/part"),
-            ("Medium  (~15MB)",      "medium", "60k tris/part"),
-            ("High  (~40MB, slow)",  "high",   "200k tris/part"),
+            ("Low  (~75MB, fast)",    "low",    "20k tris/part"),
+            ("Medium  (~100MB)",      "medium", "60k tris/part"),
+            ("High  (~200MB, slow)",  "high",   "200k tris/part"),
         ]):
             tk.Radiobutton(qf, text=lbl, variable=self.v_html_quality,
                            value=val, font=FONT, bg=BG)\
@@ -1071,7 +1072,7 @@ class SurfaceTab(ScrollableFrame):
             self.delta_entry.config(state="disabled", bg=BG_D)
 
     def refresh_scalars(self):
-        keys = list(cfg.SCALARS.keys())
+        keys = list(cfg.SURFACE_SCALARS.keys())
         self.scalar_menu['values'] = keys
         if keys and self.v_scalar.get() not in keys:
             self.v_scalar.set(keys[0])
@@ -1106,7 +1107,7 @@ class SurfaceTab(ScrollableFrame):
         def _worker():
             try:
                 import surface_render as sr, os
-                scfg = cfg.SCALARS.get(skey, {})
+                scfg = cfg.SURFACE_SCALARS.get(skey, cfg.SCALARS.get(skey, {}))
                 cmap = scfg.get('cmap', sr.make_cp_cmap())
                 clim = (scfg.get('vmin', -3.0), scfg.get('vmax', 1.0))
                 arr  = scfg.get('array', skey)
@@ -1209,31 +1210,58 @@ class SurfaceTab(ScrollableFrame):
                 import traceback; traceback.print_exc()
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _run_export(self):
-        geom    = self.v_geom.get().strip()
-        surface = self.v_surface.get().strip() or None
-        out_dir = self.v_export_out.get().strip()
-        fmt     = self.v_fmt.get()
-        merged  = self.v_merged.get()
-        if not geom:
-            messagebox.showwarning("Missing", "Set geometry .case path."); return
-        if not out_dir:
-            messagebox.showwarning("Missing", "Set output directory."); return
-        self.status_export.config(text="Running...", fg=ACCENT)
+    def _run_delta_html(self):
+        geom   = self.v_geom.get().strip()
+        surf_a = self.v_surf_a.get().strip()
+        surf_b = self.v_surf_b.get().strip()
+        out_path = self.v_delta_html_out.get().strip()
+        skey   = self.v_scalar.get().strip()
+        quality = self.v_delta_html_quality.get()
+
+        if not geom or not surf_a or not surf_b:
+            messagebox.showwarning("Missing",
+                "Set geometry and both surface .case paths."); return
+        if not out_path:
+            messagebox.showwarning("Missing",
+                "Set the output Delta .html file path."); return
+
+        fixed_range = None
+        if self.v_delta_mode.get() == "fixed":
+            try: fixed_range = float(self.v_delta_val.get())
+            except:
+                messagebox.showerror("Invalid", "Fixed range must be a number.")
+                return
+
+        quality_map = {'low': 20_000, 'medium': 60_000, 'high': 200_000}
+        tris = quality_map.get(quality, 60_000)
+
+        scfg  = cfg.SCALARS.get(skey, {})
+        arr   = scfg.get('array', skey)
+        label = scfg.get('label', skey)
+        la    = self.v_label_a.get() or "Run A"
+        lb    = self.v_label_b.get() or "Run B"
+
+        self.status_delta.config(text="Running...", fg=ACCENT)
         self.app.notebook.select(self.app.log_tab)
 
         def _worker():
             try:
                 import surface_render as sr
                 angle = float(self.v_angle.get()) if self.v_angle.get() else 25.0
-                prepared = sr.prepare_surfaces(geom, surface, feature_angle=angle)
-                scalar_keys = [cfg.SCALARS[k]['array']
-                               for k in cfg.SCALARS] if surface else None
-                sr.export_3d(prepared, scalar_keys=scalar_keys,
-                             output_dir=out_dir, fmt=fmt, merged=merged)
-                self.status_export.config(text="Done", fg="#2E7D32")
+                print("[surface] Preparing Run A...")
+                prep_a = sr.prepare_surfaces(geom, surf_a, feature_angle=angle)
+                print("[surface] Preparing Run B...")
+                prep_b = sr.prepare_surfaces(geom, surf_b, feature_angle=angle)
+                sr.export_interactive_delta_html(
+                    prep_a, prep_b, arr,
+                    label_a=la, label_b=lb, label=label,
+                    fixed_range=fixed_range,
+                    output_path=out_path,
+                    triangles_per_part=tris,
+                )
+                self.status_delta.config(text="Done", fg="#2E7D32")
             except Exception as exc:
-                self.status_export.config(text="Error", fg="#C62828")
+                self.status_delta.config(text="Error", fg="#C62828")
                 print(f"\n[ERROR] {exc}")
                 import traceback; traceback.print_exc()
         threading.Thread(target=_worker, daemon=True).start()

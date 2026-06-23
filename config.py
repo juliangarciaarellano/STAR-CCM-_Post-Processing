@@ -34,33 +34,35 @@ def _make_cp_cmap(vmin=-4.0, vmax=1.0):
     """
     STAR-CCM+ Cp palette.
     Control points are evenly distributed across [vmin, 0] and [0, vmax].
-    Grey is pinned exactly at Cp=0 regardless of vmin/vmax.
+    White is pinned exactly at Cp=0 regardless of vmin/vmax: the negative side
+    ends in green and the positive side begins in yellow.
     """
     zero_pos = (0.0 - vmin) / (vmax - vmin)
 
-    # Below zero (suction): blue -> cyan -> green,  ordered darkest->grey
+    # Below zero (suction): deep blue -> cyan -> teal -> green
+    # Ends at green just below zero, so white (Cp=0) sits between green and yellow.
     neg_colours = [
         (  0,   0, 139),   # deep blue       (most negative Cp)
         (  0,  50, 200),
         (  0, 120, 240),
         ( 30, 180, 230),   # cyan
         ( 50, 220, 180),
-        (100, 240, 100),   # green
-        (180, 240,  60),
-        (240, 230,  40),   # yellow-green    (just below zero)
+        (110, 225, 120),   # green           (just below zero)
     ]
-    # Above zero (stagnation/pressure): grey -> orange -> red
+    # Above zero (stagnation/pressure): yellow -> orange -> red
+    # Yellow is now the FIRST positive colour, just above white.
     pos_colours = [
-        (240, 160,  20),   # orange          (just above zero)
-        (230,  80,   0),
-        (200,  20,   0),
-        (140,   0,   0),   # deep red        (most positive Cp)
+        (250, 235,  70),   # yellow          (just above zero)
+        (245, 165,  30),   # orange
+        (235,  90,  10),
+        (200,  25,   0),
+        (135,   0,   0),   # deep red         (most positive Cp)
     ]
 
     ctrl = []
     for i, (r, g, b) in enumerate(neg_colours):
         ctrl.append((zero_pos * i / len(neg_colours), r, g, b))
-    ctrl.append((zero_pos, 185, 185, 185))
+    ctrl.append((zero_pos, 250, 250, 250))   # white pinned exactly at Cp=0
     for i, (r, g, b) in enumerate(pos_colours):
         ctrl.append((zero_pos + (1.0 - zero_pos) * (i + 1) / len(pos_colours), r, g, b))
 
@@ -102,7 +104,7 @@ def _make_cf_cmap(vmax=0.03):
     """
     # A very thin sliver at position 0 is pure pink
     # then immediately jumps to the blue gradient above a tiny epsilon
-    eps = 10.0 / 512   # one LUT step above zero
+    eps = 1.0 / 512   # one LUT step above zero
 
     # Blue gradient control points (positions eps..1)
     blue_ctrl = [
@@ -152,13 +154,6 @@ SCALARS = {
         'cmap':  _make_cpt_cmap(),
         'label': 'CpT',
     },
-    'Cf': {
-        'array': 'MeanSkinFrictionCoeffromVarianceofSkinF',
-        'vmin':   0.0,
-        'vmax':   0.03,
-        'cmap':  _make_cf_cmap(vmax=0.03),
-        'label': 'Cf',
-    },
     'Vi': {
         'array': 'VelocityMeanNormalizedi',
         'vmin':  -1.0,
@@ -179,6 +174,19 @@ SCALARS = {
         'vmax':   1.0,
         'cmap':  'RdBu_r',
         'label': 'Vk (norm)',
+    },
+}
+
+# Scalars that only exist on surface exports (Cp, Cf from surface .case)
+# Used by surface_render.py — NOT included in the slice pipeline Run tab
+SURFACE_SCALARS = {
+    'Cp': SCALARS['Cp'],   # Cp exists in both — share the definition
+    'Cf': {
+        'array': 'MeanSkinFrictionCoeffromVarianceofSkinF',
+        'vmin':   0.0,
+        'vmax':   0.03,
+        'cmap':  _make_cf_cmap(vmax=0.03),
+        'label': 'Cf',
     },
 }
 

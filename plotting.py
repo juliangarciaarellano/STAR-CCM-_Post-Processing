@@ -128,8 +128,12 @@ def make_slice_plot(cp_grid, mask, ax_slice, plane_idx, val_mm,
 
     valid    = cp_grid[~np.isnan(cp_grid)]
     fluid_px = int((~np.isnan(cp_grid) & ~mask).sum())
+    if valid.size:
+        rng = f"[{valid.min():.3f}, {valid.max():.3f}]"
+    else:
+        rng = "[no data]"
     title = (f"Plane {cfg.AXIS_LABEL[ax_slice]} #{plane_idx:03d}  {val_mm:+.1f} mm  "
-             f"{scalar_key} [{valid.min():.3f}, {valid.max():.3f}]  "
+             f"{scalar_key} {rng}  "
              f"({fluid_px:,} fluid px)")
 
     _apply_axes(ax, x_lo, x_hi, y_lo, y_hi, h_label, v_label, title)

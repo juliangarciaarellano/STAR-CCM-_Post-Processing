@@ -53,23 +53,40 @@ def _extract_plane_jobs(cfd_mesh, scalars_to_run, axes_to_run):
         n_unique = [len(np.unique(np.round(pts[:, a], 5))) for a in range(3)]
         detected_ax = int(np.argmin(n_unique))
 
-        # Block name hint — check if name contains X/Y/Z
+        # Block name hint — read the axis letter from the leading token so a
+        # name like 'XY_Planes' or 'Z_Planes' resolves unambiguously instead of
+        # matching whichever axis letter appears first anywhere in the string.
         block_name = cfd_mesh.get_block_name(block_idx).strip().upper()
+        lead_token = block_name.split('_')[0]
         hint_ax = None
-        for a, label in [(0,'X'),(1,'Y'),(2,'Z')]:
-            if label in block_name:
+        for a, label in [(0, 'X'), (1, 'Y'), (2, 'Z')]:
+            if lead_token == label or lead_token.startswith(label + 'PLANE'):
                 hint_ax = a
                 break
+        if hint_ax is None:
+            # Fall back to a substring check for less structured names.
+            for a, label in [(0, 'X'), (1, 'Y'), (2, 'Z')]:
+                if label in block_name:
+                    hint_ax = a
+                    break
 
-        # Use detected axis; warn if it disagrees with the name hint
-        ax = detected_ax
-        if hint_ax is not None and hint_ax != detected_ax:
-            log(f"  [WARN] Block {block_idx} ('{cfd_mesh.get_block_name(block_idx).strip()}'): "
-                f"name suggests axis {cfg.AXIS_LABEL[hint_ax]} but data is constant in "
-                f"{cfg.AXIS_LABEL[detected_ax]} "
-                f"(unique counts X={n_unique[0]:,} Y={n_unique[1]:,} Z={n_unique[2]:,}) "
-                f"— using detected axis {cfg.AXIS_LABEL[detected_ax]}")
-        elif hint_ax is None:
+        # Trust the block-name hint when present; the constant-axis heuristic
+        # is fooled by slab aspect ratio. A stack of Y-slices is thin in Y but
+        # spans the full car in X and Z, and if the car is shorter vertically
+        # than it is long, Z can have fewer unique values than Y — so argmin
+        # picks the wrong (spanning) axis and np.unique then returns one
+        # "plane" per cell-center coordinate (hundreds of thousands of them).
+        # The block name (e.g. 'Y_Planes') is authoritative; fall back to the
+        # data heuristic only when the name carries no axis letter.
+        if hint_ax is not None:
+            ax = hint_ax
+            if hint_ax != detected_ax:
+                log(f"  [INFO] Block {block_idx} ('{cfd_mesh.get_block_name(block_idx).strip()}'): "
+                    f"using name-hint axis {cfg.AXIS_LABEL[hint_ax]} "
+                    f"(data heuristic guessed {cfg.AXIS_LABEL[detected_ax]}; "
+                    f"unique counts X={n_unique[0]:,} Y={n_unique[1]:,} Z={n_unique[2]:,})")
+        else:
+            ax = detected_ax
             log(f"  [INFO] Block {block_idx} ('{cfd_mesh.get_block_name(block_idx).strip()}'): "
                 f"no axis hint in name, detected axis {cfg.AXIS_LABEL[detected_ax]} "
                 f"(unique counts X={n_unique[0]:,} Y={n_unique[1]:,} Z={n_unique[2]:,})")

@@ -1,6 +1,7 @@
 # UT26 CFD Post-Processing Pipeline
 **Author:** Julian G-A  
 **Team:** University of Toronto Formula Racing (UTFR)  
+**Vehicle:** UT26 Formula SAE
 
 A desktop application and Python pipeline for post-processing STAR-CCM+ aerodynamic simulation data exported in EnSight Gold format.
 
@@ -79,3 +80,151 @@ sudo apt install python3-tk
 ---
 
 ## File Structure
+
+```
+cfd_slicer/
+├── config.py          # All user settings — paths, scalars, colormaps, bounds
+├── geometry.py        # Geometry masking (CFD-point-veto flood fill)
+├── interpolation.py   # Per-region griddata interpolation
+├── plotting.py        # Slice and delta plot generation
+├── io_utils.py        # Case file loading, NPZ save/load, plane discovery
+├── pipeline.py        # Slice pipeline orchestration
+├── compare.py         # Run comparison and delta rendering
+├── aero_report.py     # Log file parser and aero balance report
+├── surface_render.py  # Surface rendering, part views, HTML and 3D export
+├── cli.py             # Command-line interface
+├── gui.py             # Desktop GUI (Tkinter)
+└── viz_viewer.py      # Standalone PNG browser for output folders
+```
+
+---
+
+## Output Structure
+
+```
+output/
+├── PNG/
+│   ├── Cp/
+│   │   ├── X/   slice_X_001_+100.0mm.png
+│   │   ├── Y/
+│   │   └── Z/
+│   └── CpT/
+├── NPZ/
+│   ├── X/       slice_X_001_+100.0mm.npz
+│   ├── Y/
+│   └── Z/
+```
+
+Comparison output (separate directory):
+```
+compare_RunB_vs_RunA/
+├── PNG/
+│   ├── Cp/
+│   │   ├── X/   diff_Cp_X_001_+100.0mm.png
+│   │   ├── Y/
+│   │   └── Z/
+│   └── CpT/
+└── comparison_summary.csv
+```
+
+Surface renders:
+```
+output/
+├── PNG/
+│   ├── surface_Cp_bottom.png
+│   ├── surface_Cp_iso_front.png
+│   ├── surface_Cp_Front_wing_bottom.png   ← per-component, auto-zoomed
+│   └── ...
+├── NPZ/
+│   └── ...
+└── surface_Cp.html                         ← interactive 3D
+```
+
+---
+
+## Usage
+
+### GUI
+```bash
+python gui.py
+```
+
+### CLI
+```bash
+# Run slice pipeline
+python cli.py run --scalars Cp CpT --axes X Y Z --res 2
+
+# Compare two runs
+python cli.py compare DIR_A DIR_B --label-a "Baseline" --label-b "Winglet"
+
+# Inspect a saved plane
+python cli.py info path/to/plane.npz
+
+# List all saved planes
+python cli.py list output/NPZ --axis Y
+```
+
+### Visualization Viewer
+```bash
+python viz_viewer.py
+```
+Point each field at an output directory containing a `PNG/` subfolder, then scroll through paired slices.
+
+---
+
+## Configuration
+
+All settings live in `config.py`. The most commonly changed values:
+
+```python
+GEOMETRY_CASE  = r"path/to/Geometry.case"
+DATA_CASE      = r"path/to/Raw_Data.case"
+OUTPUT_DIR     = r"path/to/output"
+
+RESOLUTION_MM  = 1       # grid resolution (1mm recommended)
+DPI            = 150     # output image DPI
+DILATION_PX    = 3       # geometry mask dilation (px)
+
+CAR_BOUNDS_2D  = {
+    0: (-0.90,  0.90, -0.10, 1.30),  # X-slice: h=Y, v=Z
+    1: (-1.10,  2.20, -0.10, 1.30),  # Y-slice: h=X, v=Z
+    2: (-1.10,  2.20, -0.90, 0.90),  # Z-slice: h=X, v=Y
+}
+```
+
+New scalar arrays can be added in the Settings tab or via the **Detect from CFD file** button, which reads array names directly from the loaded `.case` file.
+
+---
+
+## Data Format
+
+EnSight Gold (`.case` + binary data files) as exported by STAR-CCM+.
+
+The pipeline expects three types of case files:
+| File | Used for |
+|---|---|
+| `Geometry.case` | Surface geometry mesh (one block per part) |
+| `Raw_Data_XXXXX.case` | Volumetric slice data (X/Y/Z planes) |
+| `Surface_XXXXX.case` | Surface scalar data (Cp, Cf on mesh) |
+
+---
+
+## Dependencies
+
+| Package | Purpose |
+|---|---|
+| `pyvista` | Mesh I/O, surface extraction, offscreen rendering |
+| `numpy` | Grid operations, masking, NPZ I/O |
+| `scipy` | KD-tree matching, griddata interpolation |
+| `scikit-image` | Line rasterization for geometry masking |
+| `matplotlib` | Plot generation, colormaps |
+| `plotly` | Interactive 3D HTML export |
+| `pillow` | Image loading for the visualization viewer |
+| `tkinter` | Desktop GUI |
+
+Python 3.10+ required.
+
+---
+
+*Do not distribute without permission.*  
+*Julian G-A *

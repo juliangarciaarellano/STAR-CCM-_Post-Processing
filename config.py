@@ -34,35 +34,33 @@ def _make_cp_cmap(vmin=-4.0, vmax=1.0):
     """
     STAR-CCM+ Cp palette.
     Control points are evenly distributed across [vmin, 0] and [0, vmax].
-    White is pinned exactly at Cp=0 regardless of vmin/vmax: the negative side
-    ends in green and the positive side begins in yellow.
+    Grey is pinned exactly at Cp=0 regardless of vmin/vmax.
     """
     zero_pos = (0.0 - vmin) / (vmax - vmin)
 
-    # Below zero (suction): deep blue -> cyan -> teal -> green
-    # Ends at green just below zero, so white (Cp=0) sits between green and yellow.
+    # Below zero (suction): blue -> cyan -> green,  ordered darkest->grey
     neg_colours = [
         (  0,   0, 139),   # deep blue       (most negative Cp)
         (  0,  50, 200),
         (  0, 120, 240),
         ( 30, 180, 230),   # cyan
         ( 50, 220, 180),
-        (110, 225, 120),   # green           (just below zero)
+        (100, 240, 100),   # green
+        (180, 240,  60),
+        (240, 230,  40),   # yellow-green    (just below zero)
     ]
-    # Above zero (stagnation/pressure): yellow -> orange -> red
-    # Yellow is now the FIRST positive colour, just above white.
+    # Above zero (stagnation/pressure): grey -> orange -> red
     pos_colours = [
-        (250, 235,  70),   # yellow          (just above zero)
-        (245, 165,  30),   # orange
-        (235,  90,  10),
-        (200,  25,   0),
-        (135,   0,   0),   # deep red         (most positive Cp)
+        (240, 160,  20),   # orange          (just above zero)
+        (230,  80,   0),
+        (200,  20,   0),
+        (140,   0,   0),   # deep red        (most positive Cp)
     ]
 
     ctrl = []
     for i, (r, g, b) in enumerate(neg_colours):
         ctrl.append((zero_pos * i / len(neg_colours), r, g, b))
-    ctrl.append((zero_pos, 250, 250, 250))   # white pinned exactly at Cp=0
+    ctrl.append((zero_pos, 185, 185, 185))
     for i, (r, g, b) in enumerate(pos_colours):
         ctrl.append((zero_pos + (1.0 - zero_pos) * (i + 1) / len(pos_colours), r, g, b))
 
@@ -139,6 +137,30 @@ def _make_cf_cmap(vmax=0.03):
     return mcolors.LinearSegmentedColormap('cf_custom', cdict, N=512)
 
 
+def _make_vort_cmap():
+    """
+    Vorticity magnitude palette — white -> dark blue sequential.
+    White is pinned at zero (low magnitude); colour deepens through
+    blue as magnitude increases, ending dark blue at vmax.
+
+        zero / low magnitude -> white
+        high magnitude       -> dark blue
+    """
+    ctrl = [
+        (0.00, 255, 255, 255),   # white       (zero / low magnitude)
+        (0.25, 198, 219, 239),   # very light blue
+        (0.50, 107, 174, 214),   # mid blue
+        (0.75,  33, 113, 181),   # blue
+        (1.00,   8,  48, 107),   # dark blue   (high magnitude)
+    ]
+    cdict = {
+        'red':   [(p, r/255, r/255) for p, r, g, b in ctrl],
+        'green': [(p, g/255, g/255) for p, r, g, b in ctrl],
+        'blue':  [(p, b/255, b/255) for p, r, g, b in ctrl],
+    }
+    return mcolors.LinearSegmentedColormap('vort_custom', cdict, N=512)
+
+
 SCALARS = {
     'Cp': {
         'array': 'MeanPressureCoeffromVarianceofPressureC',
@@ -175,6 +197,13 @@ SCALARS = {
         'cmap':  'RdBu_r',
         'label': 'Vk (norm)',
     },
+    'Vort': {
+        'array': 'VorticityMagnitude',
+        'vmin':   100.0,
+        'vmax':   1500.0,
+        'cmap':  _make_vort_cmap(),
+        'label': 'Vorticity Mag (1/s)',
+    },
 }
 
 # Scalars that only exist on surface exports (Cp, Cf from surface .case)
@@ -210,7 +239,7 @@ CAR_BOUNDS_2D = {
 #  GRID & MASK
 # ══════════════════════════════════════════════════════════════════
 RESOLUTION_MM = 1     # mm per pixel — increase to 2 or 5 for speed
-DILATION_PX   = 3     # px to dilate geometry lines (closes surface mesh gaps)
+DILATION_PX   = 1     # px to dilate geometry lines (closes surface mesh gaps)
 
 
 # ══════════════════════════════════════════════════════════════════

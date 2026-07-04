@@ -91,30 +91,30 @@ def make_cp_cmap(mute=0.45, vmin=-4.0, vmax=1.0):
     mute=0.0 -> full saturation, mute=1.0 -> all gray.
 
     Control points are defined as (position_0_to_1, r, g, b) where position
-    is a fraction of the full [vmin, vmax] range.  White is pinned at exactly
-    the position corresponding to Cp=0: negative ends in green, positive begins
-    in yellow.
+    is a fraction of the full [vmin, vmax] range.  Grey is pinned at exactly
+    the position corresponding to Cp=0, regardless of vmin/vmax.
     """
     # Position of Cp=0 in the normalised [0,1] range
     zero_pos = (0.0 - vmin) / (vmax - vmin)   # e.g. 0.80 for vmin=-4, vmax=1
 
     # Control points defined in normalised [0,1] space
-    # Negative half (suction): deep blue -> cyan -> teal -> green (ends below zero)
-    # Positive half (pressure): yellow -> orange -> red (yellow just above zero)
+    # Negative half: 13 evenly spaced points from 0.0 to zero_pos (blue->grey)
+    # Positive half: proportional points from zero_pos to 1.0 (grey->red)
     neg_colours = [
         (  0,   0, 139),   # pos=0.000  deep blue
-        (  0,  50, 200),
-        (  0, 120, 240),
-        ( 30, 180, 230),   # cyan
-        ( 50, 220, 180),
-        (110, 225, 120),   # green      just below zero
+        (  0,  50, 200),   # pos~0.133
+        (  0, 120, 240),   # pos~0.267
+        ( 30, 180, 230),   # pos~0.400
+        ( 50, 220, 180),   # pos~0.533
+        (100, 240, 100),   # pos~0.667
+        (180, 240,  60),   # pos~0.800
+        (240, 200,  50),   # pos~0.933  just below zero
     ]
     pos_colours = [
-        (250, 235,  70),   # yellow     just above zero
-        (245, 165,  30),   # orange
-        (235,  90,  10),
-        (200,  25,   0),
-        (135,   0,   0),   # pos=1.000  deep red
+        (240, 140,  30),   # just above zero
+        (220,  60,  10),
+        (160,  20,   5),
+        (120,  10,   5),   # pos=1.000  deep red
     ]
 
     # Build list of (position, r, g, b)
@@ -124,7 +124,7 @@ def make_cp_cmap(mute=0.45, vmin=-4.0, vmax=1.0):
     for i, (r, g, b) in enumerate(neg_colours):
         p = zero_pos * i / n_neg
         ctrl.append((p, r, g, b))
-    ctrl.append((zero_pos, 250, 250, 250))   # white exactly at Cp=0
+    ctrl.append((zero_pos, 185, 185, 185))   # grey exactly at Cp=0
     for i, (r, g, b) in enumerate(pos_colours):
         p = zero_pos + (1.0 - zero_pos) * (i + 1) / n_pos
         ctrl.append((p, r, g, b))
@@ -132,9 +132,9 @@ def make_cp_cmap(mute=0.45, vmin=-4.0, vmax=1.0):
     gray = np.array([160, 160, 160])
     muted = []
     for p, r, g, b in ctrl:
-        # Pin white exactly — don't blend
+        # Pin grey exactly — don't blend
         if abs(p - zero_pos) < 1e-9:
-            muted.append((p, 250, 250, 250))
+            muted.append((p, 185, 185, 185))
         else:
             muted.append((p,
                           int(r*(1-mute)+gray[0]*mute),
@@ -231,14 +231,14 @@ def prepare_surfaces(geom_case, surface_case=None, scalars=None,
         prepared.append(dict(name=name, surf=surf, edges=edges))
         print(f"  {name}: {surf.n_cells:,} cells")
 
-    # ── Part grouping ─────────────────────────────────────────────
-    # The .case already splits the endplates into their own parts
-    # ('Front wing EPs', 'Rear wing EPs'). Keep them separate so each can be
-    # given its own triangle allotment in export_interactive_html. Add entries
-    # to MERGE_GROUPS only if you ever want parts combined again.
-    MERGE_GROUPS = {}
-    if MERGE_GROUPS:
-        prepared = _merge_parts(prepared, MERGE_GROUPS)
+    # ── Merge related parts into logical groups ───────────────────
+    # FW + FW EPs -> 'Front wing'
+    # RW + RW EPs -> 'Rear wing'
+    MERGE_GROUPS = {
+        'Front wing': ['Front wing', 'Front wing EPs'],
+        'Rear wing':  ['Rear wing',  'Rear wing EPs'],
+    }
+    prepared = _merge_parts(prepared, MERGE_GROUPS)
 
     print(f"[surface_render] Prepared {len(prepared)} parts "
           f"in {time.perf_counter()-t0:.1f}s")
@@ -312,7 +312,6 @@ def _render_one_view(parts, scalar_key, cmap, clim,
             else window_size
     pl = pv.Plotter(off_screen=True, window_size=list(wsize))
     pl.set_background(bg_color)
-    pl.enable_parallel_projection()   # orthographic — no perspective foreshortening
 
     for part in parts:
         surf  = part['surf']
@@ -417,9 +416,7 @@ def render_views(prepared, scalar_key, cmap=None, clim=(-3.0, 1.0),
     views_to_render = views or list(VIEWS.keys())
 
     png_dir = os.path.join(output_dir, 'PNG') if output_dir else None
-    npz_dir = os.path.join(output_dir, 'NPZ') if output_dir else None
     if png_dir: os.makedirs(png_dir, exist_ok=True)
-    if npz_dir: os.makedirs(npz_dir, exist_ok=True)
 
     imgs = {}
     for vname in views_to_render:
@@ -454,18 +451,6 @@ def render_views(prepared, scalar_key, cmap=None, clim=(-3.0, 1.0),
             plt.close(fig)
             print(f"  saved: PNG/{os.path.basename(out_path)}")
 
-            # ── NPZ ──────────────────────────────────────────────
-            npz_path = os.path.join(npz_dir, f'{file_stem}_{vname}.npz')
-            np.savez_compressed(
-                npz_path,
-                image      = img.astype(np.uint8),
-                view       = np.bytes_(vname),
-                scalar_key = np.bytes_(scalar_key),
-                clim       = np.array(clim, dtype=np.float32),
-                file_stem  = np.bytes_(file_stem),
-            )
-            print(f"  saved: NPZ/{os.path.basename(npz_path)}")
-
         print(f"  {vname}: {time.perf_counter()-t0:.1f}s")
 
     return imgs
@@ -498,9 +483,7 @@ def render_part_views(prepared, part_names, scalar_key,
     views_to_render = views or list(VIEWS.keys())
 
     png_dir = os.path.join(output_dir, 'PNG') if output_dir else None
-    npz_dir = os.path.join(output_dir, 'NPZ') if output_dir else None
     if png_dir: os.makedirs(png_dir, exist_ok=True)
-    if npz_dir: os.makedirs(npz_dir, exist_ok=True)
 
     # Build name -> part lookup
     part_lookup = {p['name']: p for p in prepared}
@@ -548,20 +531,6 @@ def render_part_views(prepared, part_names, scalar_key,
                 plt.close(fig)
                 print(f"  saved: PNG/{os.path.basename(out_path)}")
 
-                # ── NPZ ──────────────────────────────────────────
-                npz_path = os.path.join(npz_dir,
-                                        f'{file_stem}_{safe_name}_{vname}.npz')
-                np.savez_compressed(
-                    npz_path,
-                    image      = img.astype(np.uint8),
-                    view       = np.bytes_(vname),
-                    part_name  = np.bytes_(pname),
-                    scalar_key = np.bytes_(scalar_key),
-                    clim       = np.array(clim, dtype=np.float32),
-                    file_stem  = np.bytes_(file_stem),
-                )
-                print(f"  saved: NPZ/{os.path.basename(npz_path)}")
-
             print(f"  {pname} / {vname}: {time.perf_counter()-t0:.1f}s")
 
     return results
@@ -572,7 +541,8 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
                        label_a='Run A', label_b='Run B',
                        views=None, window_size=(1600, 1000),
                        fixed_range=None, feature_angle=25,
-                       bg_color='white'):
+                       bg_color='white',
+                       output_dir=None, file_stem='surface_delta'):
     """
     Render delta views (B - A) with three-colour geometry overlay.
 
@@ -587,10 +557,13 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
     scalar_key   : str
     fixed_range  : float or None   symmetric clim for delta colormap
     views        : list of str or None
+    output_dir   : str or None   if set, saves one PNG per view
+                   under a PNG/ subdirectory
+    file_stem    : str           prefix for output filenames
 
     Returns
     -------
-    dict[view_name, np.ndarray]
+    dict[view_name, np.ndarray], clim
     """
     views_to_render = views or list(VIEWS.keys())
 
@@ -657,6 +630,9 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
     else:
         clim = (-fixed_range, fixed_range)
 
+    png_dir = os.path.join(output_dir, 'PNG') if output_dir else None
+    if png_dir: os.makedirs(png_dir, exist_ok=True)
+
     imgs = {}
     for vname in views_to_render:
         if vname not in VIEWS:
@@ -668,7 +644,6 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
                 else window_size
         pl = pv.Plotter(off_screen=True, window_size=list(wsize))
         pl.set_background(bg_color)
-        pl.enable_parallel_projection()   # orthographic — no perspective foreshortening
 
         for part in delta_parts:
             if part['has_delta']:
@@ -710,8 +685,37 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
         if fill > 0:
             pl.camera.zoom(0.85 / fill)
 
-        imgs[vname] = pl.screenshot(None, return_img=True)
+        img = pl.screenshot(None, return_img=True)
+        imgs[vname] = img
         pl.close()
+
+        if output_dir:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.colors as mc
+
+            # ── PNG ──────────────────────────────────────────────
+            fig, ax = plt.subplots(figsize=(12, 7), facecolor=bg_color)
+            ax.imshow(img); ax.axis('off')
+            sm = plt.cm.ScalarMappable(cmap='RdBu_r',
+                 norm=mc.Normalize(vmin=clim[0], vmax=clim[1]))
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02)
+            cbar.ax.tick_params(labelsize=8)
+            cbar.set_label(f'delta {scalar_key}  ({label_b} - {label_a})',
+                           fontsize=9)
+            ax.set_title(
+                f'{file_stem}  --  {vname.replace("_"," ").title()}'
+                f'   ({label_b} - {label_a})',
+                fontsize=11,
+                color='black' if bg_color == 'white' else 'white')
+            out_path = os.path.join(png_dir, f'{file_stem}_{vname}.png')
+            fig.savefig(out_path, dpi=150, facecolor=bg_color,
+                        bbox_inches='tight')
+            plt.close(fig)
+            print(f"  saved: PNG/{os.path.basename(out_path)}")
+
         print(f"  {vname}: {time.perf_counter()-t0:.1f}s")
 
     return imgs, clim
@@ -796,199 +800,135 @@ def export_3d(prepared, scalar_keys=None, output_dir='.',
 def export_interactive_html(prepared, scalar_key, cmap=None,
                             clim=(-3.0, 1.0), label='Cp',
                             output_path='surface.html',
-                            triangles_per_part=80_000,
-                            endplate_triangles=None,
-                            endplate_tokens=('ep', 'eps', 'endplate', 'endplates'),
-                            part_triangles=None,
-                            feature_angle=45.0,
-                            orthographic=True):
+                            triangles_per_part=60_000):
     """
-    Smooth-filled interactive Plotly 3D export.
+    Export an interactive Plotly 3D HTML file.
+    Opens in any browser — no software installation required.
+    Drag to rotate, scroll to zoom, click legend to toggle parts.
 
-    Fill: smooth (Gouraud) vertex colouring. Cell values are converted to point
-    values AFTER splitting vertices along sharp feature edges (feature_angle), so
-    a thin element's two faces are decoupled and the field does not bleed across
-    the trailing edge.
+    Parameters
+    ----------
+    prepared          : list from prepare_surfaces()
+    scalar_key        : str   array name to colour by
+    cmap              : matplotlib colormap or None (uses make_cp_cmap())
+    clim              : (vmin, vmax)
+    label             : str   colorbar label
+    output_path       : str   path to .html output file
+    triangles_per_part: int   decimate each part to this many triangles
+                              for browser performance (default 60_000)
 
-    Decimation uses topology-preserving vtkDecimatePro (NOT vtkQuadricClustering):
-    it collapses edges along the existing surface, so the two faces of a thin
-    shell never merge and no stray edge triangles appear, and it carries the
-    scalar through as interpolated point data (no resample -> none of the quadric
-    speckle).
-
-    Two-tier allotment:
-      * Endplates (name contains an `endplate_tokens` token) target
-        `endplate_triangles` (default 250k). They are thin shells with sharp
-        cascade trailing edges that need more triangles than a wing to stay crisp;
-        at the wing budget (80k) the cascades coarsen and the two faces visually
-        recouple (the recurring EP bleed). Set endplate_triangles=None to keep
-        them at full native resolution.
-      * Everything else targets `triangles_per_part` (default 80k).
-
-    Per-part overrides: `part_triangles` maps a name substring -> target (an int,
-    or None for full native). Checked AFTER the endplate rule, so endplates always
-    keep their tier. Defaults give the Bodywork extra density (it is physically
-    large) and the Side Wings full native resolution (they contain endplates that
-    cannot be name-split out, so decimating the part would bleed them).
-
-    reduction = 1 - target/n; a part already below its target stays full res.
-    Parts missing the scalar are skipped (never zero-filled). Parallel projection.
+    Returns
+    -------
+    str   path to saved HTML file
     """
-    import time, os
-    import numpy as np
-    import pyvista as pv
     try:
         import plotly.graph_objects as go
     except ImportError:
         raise ImportError("plotly is required: pip install plotly")
 
-    if part_triangles is None:
-        part_triangles = {
-            'Side Wings': None,      # embedded endplates -> full native (no bleed)
-            'Bodywork':   250_000,   # physically large -> extra density
-        }
-
     if cmap is None:
         cmap = make_cp_cmap(vmin=clim[0], vmax=clim[1])
 
+    # Build Plotly colorscale from matplotlib colormap
     vmin, vmax = clim
     positions  = np.linspace(0, 1, 64)
     rgba       = cmap(positions)
     colorscale = [[float(p), f'rgb({int(r*255)},{int(g*255)},{int(b*255)})']
                   for p, (r, g, b, _) in zip(positions, rgba)]
 
-    def _target_for(name):
-        nl   = name.lower()
-        toks = nl.replace('/', ' ').replace('-', ' ').split()
-        # endplate parts always keep their tier (checked first so a 'Front wing'
-        # override can't accidentally swallow 'Front wing EPs')
-        if any(t in endplate_tokens for t in toks) or 'endplate' in nl:
-            return endplate_triangles
-        # explicit per-part overrides (substring match)
-        for key, tgt in part_triangles.items():
-            if key.lower() in nl:
-                return tgt
-        return triangles_per_part
+    print(f"[surface_render] Building interactive HTML "
+          f"({triangles_per_part:,} tris/part)...")
+    traces = []
+    first  = True
 
-    def _prep(surf, target):
-        """Triangulate, split sharp edges, cell->point; decimate unless full_res."""
-        s = surf if isinstance(surf, pv.PolyData) else surf.extract_surface()
-        s = s.copy()
+    for part in prepared:
+        surf = part['surf']
+        name = part['name']
+        if scalar_key not in surf.cell_data:
+            continue
+
+        t0 = time.perf_counter()
+
+        # Copy only the scalar we need
+        s = surf.copy()
         for k in list(s.cell_data.keys()):
             if k != scalar_key:
                 s.cell_data.remove(k)
-        for k in list(s.point_data.keys()):
-            s.point_data.remove(k)
 
-        tri = s.triangulate()
-        # Split vertices along sharp folds so a thin element's two faces are
-        # decoupled for the cell->point average (prevents trailing-edge bleed).
-        try:
-            tri = tri.compute_normals(split_vertices=True, feature_angle=feature_angle,
-                                      cell_normals=False, point_normals=True,
-                                      consistent_normals=False)
-        except Exception:
-            pass
-        pt = tri.cell_data_to_point_data()
+        # Fast grid-based simplification via vtkQuadricClustering
+        # Works on mixed cell types (quads + tris), no triangulation needed
+        # Target ~triangles_per_part cells by tuning grid divisions
+        import vtk as _vtk
+        divisions = max(30, int((triangles_per_part / 3) ** (1/2)))
+        qc = _vtk.vtkQuadricClustering()
+        qc.SetInputData(s)
+        qc.SetNumberOfDivisions(divisions, divisions, divisions)
+        qc.AutoAdjustNumberOfDivisionsOn()
+        qc.Update()
+        simplified = pv.wrap(qc.GetOutput())
 
-        if target is not None and pt.n_cells > target * 1.05:
-            red = 1.0 - target / float(pt.n_cells)
-            try:
-                dec = pt.decimate_pro(red, preserve_topology=True,
-                                      feature_angle=feature_angle, splitting=False)
-                if dec.n_points > 0 and scalar_key in dec.point_data and dec.n_cells > 0:
-                    pt = dec
-            except Exception:
-                pass
-        for k in list(pt.point_data.keys()):
-            if k != scalar_key:
-                pt.point_data.remove(k)
-        return pt.triangulate()
+        # Triangulate the simplified mesh for Plotly (needs triangles)
+        tri    = simplified.triangulate()
+        pts    = tri.points
+        faces  = tri.faces.reshape(-1, 4)[:, 1:]
 
-    _ep_desc = "full native res" if endplate_triangles is None else f"~{endplate_triangles:,} tris"
-    print(f"[surface_render] Building interactive HTML (smooth fill; "
-          f"endplates {_ep_desc}, others ~{triangles_per_part:,} tris)...")
-
-    traces, first, skipped, summary = [], True, [], []
-    gmin = np.array([np.inf, np.inf, np.inf])
-    gmax = np.array([-np.inf, -np.inf, -np.inf])
-    for part in prepared:
-        surf, name = part['surf'], part['name']
-        if scalar_key not in surf.cell_data:
-            skipped.append(name); continue
-
-        target = _target_for(name)
-        t0 = time.perf_counter()
-        mesh = _prep(surf, target)
-        if mesh.n_cells == 0 or scalar_key not in mesh.point_data:
-            skipped.append(name); continue
-
-        pts   = mesh.points
-        faces = mesh.faces.reshape(-1, 4)[:, 1:]
-        vals  = mesh.point_data[scalar_key].astype(np.float32)
-        gmin  = np.minimum(gmin, pts.min(axis=0))
-        gmax  = np.maximum(gmax, pts.max(axis=0))
+        # cell_data_to_point_data for smooth vertex colours
+        tri_pt  = tri.cell_data_to_point_data()
+        pt_vals = tri_pt.point_data.get(
+            scalar_key, np.zeros(len(pts), dtype=np.float32)
+        ).astype(np.float32)
 
         trace = go.Mesh3d(
             x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
             i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-            intensity=vals,                # per-VERTEX -> smooth Gouraud fill
-            colorscale=colorscale, cmin=vmin, cmax=vmax,
+            intensity=pt_vals,
+            colorscale=colorscale,
+            cmin=vmin, cmax=vmax,
             showscale=first,
-            colorbar=dict(title=dict(text=label, side='right'),
-                          thickness=18, len=0.6, tickfont=dict(size=11)) if first else None,
+            colorbar=dict(
+                title=dict(text=label, side='right'),
+                thickness=18, len=0.6,
+                tickfont=dict(size=11),
+            ) if first else None,
             name=name,
-            flatshading=False,             # smooth, not faceted
             lighting=dict(ambient=0.9, diffuse=0.1, specular=0.0),
-            hovertemplate=(f'<b>{name}</b><br>{label}: %{{intensity:.3f}}<extra></extra>'),
+            flatshading=False,
+            hovertemplate=(f'<b>{name}</b><br>'
+                           f'{label}: %{{intensity:.3f}}<extra></extra>'),
             showlegend=True,
         )
-        traces.append(trace); first = False
-        nl = name.lower()
-        if any(t in endplate_tokens for t in nl.replace('/',' ').replace('-',' ').split()) or 'endplate' in nl:
-            tag = 'EP'
-        elif any(k.lower() in nl for k in part_triangles):
-            tag = 'cust'
-        else:
-            tag = 'std'
-        summary.append((name, surf.n_cells, mesh.n_cells, tag))
-        print(f"  {name}: {surf.n_cells:,} cells -> {mesh.n_cells:,} tris [{tag}]  "
-              f"({time.perf_counter()-t0:.1f}s)")
-
-    if skipped:
-        print(f"[surface_render] WARNING: '{scalar_key}' not found on "
-              f"{len(skipped)} part(s); SKIPPED (not zero-filled): {skipped}")
-    print(f"[surface_render] total triangles: {sum(r[2] for r in summary):,}")
+        traces.append(trace)
+        first = False
+        print(f"  {name}: {len(faces):,} tris  ({time.perf_counter()-t0:.1f}s)")
 
     fig = go.Figure(data=traces)
-    # Pin axis ranges to the full-model bounding box (+small pad) so toggling
-    # parts in the legend does NOT autoscale the scene: every part keeps its true
-    # real-world size and position regardless of what else is visible.
-    pad = 0.02 * float((gmax - gmin).max()) if np.isfinite(gmin).all() else 0.0
-    xr = [float(gmin[0]-pad), float(gmax[0]+pad)]
-    yr = [float(gmin[1]-pad), float(gmax[1]+pad)]
-    zr = [float(gmin[2]-pad), float(gmax[2]+pad)]
-    scene = dict(
-        xaxis=dict(title='X (m)', range=xr, autorange=False,
-                   backgroundcolor='#f8f8f8', gridcolor='#ddd', showbackground=True),
-        yaxis=dict(title='Y (m)', range=yr, autorange=False,
-                   backgroundcolor='#f8f8f8', gridcolor='#ddd', showbackground=True),
-        zaxis=dict(title='Z (m)', range=zr, autorange=False,
-                   backgroundcolor='#f8f8f8', gridcolor='#ddd', showbackground=True),
-        aspectmode='data',     # 1 m is the same on-screen length on every axis
-        camera=dict(eye=dict(x=-1.2, y=-1.2, z=0.7)),
-    )
-    if orthographic:
-        scene['camera']['projection'] = dict(type='orthographic')
     fig.update_layout(
-        title=dict(text=(f'UT26 -- Surface {label}  |  drag to rotate  /  scroll to zoom  /  '
-                         f'click legend to toggle parts'), font=dict(size=13)),
-        scene=scene, paper_bgcolor='white',
-        legend=dict(x=0.01, y=0.99, bgcolor='rgba(255,255,255,0.85)',
-                    bordercolor='#ccc', borderwidth=1, font=dict(size=11)),
-        width=1400, height=900, margin=dict(l=0, r=0, t=40, b=0),
+        title=dict(
+            text=(f'UT26 — Surface {label}  |  '
+                  f'drag to rotate  ·  scroll to zoom  ·  '
+                  f'click legend to toggle parts'),
+            font=dict(size=13)),
+        scene=dict(
+            xaxis=dict(title='X (m)', backgroundcolor='#f8f8f8',
+                       gridcolor='#ddd', showbackground=True),
+            yaxis=dict(title='Y (m)', backgroundcolor='#f8f8f8',
+                       gridcolor='#ddd', showbackground=True),
+            zaxis=dict(title='Z (m)', backgroundcolor='#f8f8f8',
+                       gridcolor='#ddd', showbackground=True),
+            aspectmode='data',
+            camera=dict(eye=dict(x=-1.2, y=-1.2, z=0.7)),
+        ),
+        paper_bgcolor='white',
+        legend=dict(x=0.01, y=0.99,
+                    bgcolor='rgba(255,255,255,0.85)',
+                    bordercolor='#ccc', borderwidth=1,
+                    font=dict(size=11)),
+        width=1400, height=900,
+        margin=dict(l=0, r=0, t=40, b=0),
     )
+
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     fig.write_html(output_path, include_plotlyjs='cdn')
-    print(f"[surface_render] Saved -> {output_path}  ({os.path.getsize(output_path)/1e6:.1f}MB)")
+    size_mb = os.path.getsize(output_path) / 1e6
+    print(f"[surface_render] Saved interactive HTML -> {output_path}  ({size_mb:.1f}MB)")
     return output_path

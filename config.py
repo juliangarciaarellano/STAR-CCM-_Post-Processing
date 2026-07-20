@@ -9,7 +9,9 @@
 ================================================================================
 """
 
+import numpy as np
 import matplotlib.colors as mcolors
+from matplotlib.colors import TwoSlopeNorm, Normalize
 
 # ══════════════════════════════════════════════════════════════════
 #  FILE PATHS
@@ -17,6 +19,47 @@ import matplotlib.colors as mcolors
 GEOMETRY_CASE = r""
 DATA_CASE     = r""
 OUTPUT_DIR    = r""
+
+
+# ══════════════════════════════════════════════════════════════════
+#  NORM & LEVEL HELPERS
+#  Default behaviour: pin the colormap center (white for diverging
+#  maps) at exactly 0 whenever the scalar range spans zero — even if
+#  vmin/vmax are uneven (e.g. Vi at [-1, 2]).
+#
+#  Per-scalar overrides via the 'center' key in SCALARS:
+#    'center': None   -> plain linear norm, no centering
+#    'center': 0.25   -> pin the center at 0.25 instead of 0
+#    (key absent)     -> center at 0 if the range spans it
+# ══════════════════════════════════════════════════════════════════
+
+def get_norm(scalar_cfg):
+    """Builds the norm for a scalar. See header comment for behaviour."""
+    vmin, vmax = scalar_cfg['vmin'], scalar_cfg['vmax']
+    center = scalar_cfg.get('center', 0.0)
+
+    if center is not None and vmin < center < vmax:
+        return TwoSlopeNorm(vmin=vmin, vcenter=center, vmax=vmax)
+    return Normalize(vmin=vmin, vmax=vmax)
+
+
+def get_levels(scalar_cfg, n_levels=101):
+    """Contour levels that always include the center value exactly,
+    so the white band sits crisply at 0 (or the custom center).
+    Falls back to plain linspace when no centering applies.
+    """
+    vmin, vmax = scalar_cfg['vmin'], scalar_cfg['vmax']
+    center = scalar_cfg.get('center', 0.0)
+
+    if center is None or not (vmin < center < vmax):
+        return np.linspace(vmin, vmax, n_levels)
+
+    # Split levels proportionally either side of the center
+    n_neg = max(2, int(round(n_levels * (center - vmin) / (vmax - vmin))))
+    n_pos = max(2, n_levels - n_neg + 1)
+    neg = np.linspace(vmin, center, n_neg)
+    pos = np.linspace(center, vmax, n_pos)[1:]   # drop duplicate center
+    return np.concatenate([neg, pos])
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -28,6 +71,7 @@ OUTPUT_DIR    = r""
 #    vmax    : colormap upper bound (clipped)
 #    cmap    : matplotlib colormap name OR a LinearSegmentedColormap object
 #    label   : axis / colorbar label
+#    center  : (optional) colormap center override — see helpers above
 # ══════════════════════════════════════════════════════════════════
 
 def _make_cp_cmap(vmin=-4.0, vmax=1.0):
@@ -168,6 +212,7 @@ SCALARS = {
         'vmax':   1.0,
         'cmap':  _make_cp_cmap(),
         'label': 'Cp',
+        'center': None,   # zero position is baked into the colormap itself
     },
     'CpT': {
         'array': 'MeanCpTinRRFfromVarianceofCpTinRRF',
@@ -175,13 +220,15 @@ SCALARS = {
         'vmax':   1.0,
         'cmap':  _make_cpt_cmap(),
         'label': 'CpT',
+        'center': None,   # zero position is baked into the colormap itself
     },
     'Vi': {
         'array': 'VelocityMeanNormalizedi',
         'vmin':  -1.0,
-        'vmax':   1.0,
+        'vmax':   2.0,
         'cmap':  'RdBu_r',
         'label': 'Vi (norm)',
+        # no 'center' key -> white pinned at 0 despite the uneven range
     },
     'Vj': {
         'array': 'VelocityMeanNormalizedj',
@@ -203,6 +250,7 @@ SCALARS = {
         'vmax':   1500.0,
         'cmap':  _make_vort_cmap(),
         'label': 'Vorticity Mag (1/s)',
+        'center': None,   # sequential map, range doesn't span zero
     },
 }
 
@@ -216,6 +264,7 @@ SURFACE_SCALARS = {
         'vmax':   0.03,
         'cmap':  _make_cf_cmap(vmax=0.03),
         'label': 'Cf',
+        'center': None,   # sentinel-pink-at-zero map, do not re-center
     },
 }
 

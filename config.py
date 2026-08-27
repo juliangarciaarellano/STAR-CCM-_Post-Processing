@@ -89,17 +89,18 @@ def _make_cp_cmap(vmin=-4.0, vmax=1.0):
         (  0, 120, 240),
         ( 30, 180, 230),   # cyan
         ( 50, 220, 180),
-        (100, 240, 100),   # green
-        (180, 240,  60),
-        (240, 230,  40),   # yellow-green    (just below zero)
+        (110, 225, 120),   # green           (just below zero)
     ]
-    # Above zero (stagnation/pressure): grey -> orange -> red
+    # Above zero (stagnation/pressure): yellow -> orange -> red
+    # Yellow is now the FIRST positive colour, just above white.
     pos_colours = [
-        (240, 160,  20),   # orange          (just above zero)
-        (230,  80,   0),
-        (200,  20,   0),
-        (140,   0,   0),   # deep red        (most positive Cp)
+        (250, 235,  70),   # yellow          (just above zero)
+        (245, 165,  30),   # orange
+        (235,  90,  10),
+        (200,  25,   0),
+        (135,   0,   0),   # deep red         (most positive Cp)
     ]
+    
 
     ctrl = []
     for i, (r, g, b) in enumerate(neg_colours):

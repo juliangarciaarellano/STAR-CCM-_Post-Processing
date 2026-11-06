@@ -27,6 +27,9 @@ make_diff_plot(grid_a, grid_b, mask_a, mask_b, ax_slice, plane_idx, val_mm,
     fixed_range : float or None
         If float, colormap is fixed to +/- this value for all planes.
         If None, auto-scales per plane to +/- max(|diff|).
+
+style_colorbar(cbar, vmin, vmax, n=None)
+    STAR-CCM+ style ticks: n evenly spaced, '< vmin' / '> vmax' on the ends.
 """
 
 import matplotlib
@@ -43,6 +46,35 @@ import config as cfg
 # Maximum figure width — prevents Tk pixmap overflow on wide planes.
 # At 150 DPI, 24in = 3600px which stays within Tk's buffer limits.
 MAX_FIG_WIDTH = 24.0
+
+
+# ── Colorbar helper ───────────────────────────────────────────────
+
+def _fmt_tick(v):
+    v = round(float(v), 6)
+    return f"{v:g}" if abs(v) >= 1e-6 else "0"
+
+
+def colorbar_ticks(vmin, vmax, n=None):
+    """
+    Evenly spaced ticks with '<' / '>' markers on the end labels, matching
+    the STAR-CCM+ legend style (e.g. < -4, -2.75, -1.5, -0.25, > 1).
+    Returns (tick_values, tick_labels).
+    """
+    n = max(2, int(n or cfg.COLORBAR_TICKS))
+    ticks = np.linspace(vmin, vmax, n)
+    labels = [_fmt_tick(t) for t in ticks]
+    labels[0]  = f"< {labels[0]}"
+    labels[-1] = f"> {labels[-1]}"
+    return ticks, labels
+
+
+def style_colorbar(cbar, vmin, vmax, n=None):
+    """Apply STAR-style ticks to an existing matplotlib colorbar."""
+    ticks, labels = colorbar_ticks(vmin, vmax, n)
+    cbar.set_ticks(ticks)
+    cbar.set_ticklabels(labels)
+    return cbar
 
 
 # ── Geometry overlay helpers ──────────────────────────────────────
@@ -71,14 +103,19 @@ def _diff_geometry_overlay(mask_a, mask_b):
     return rgba
 
 
-def _apply_axes(ax, x_lo, x_hi, y_lo, y_hi, h_label, v_label, title):
+def _apply_axes(ax, x_lo, x_hi, y_lo, y_hi, h_label, v_label, title,
+                ax_slice=None):
     tick_m = cfg.TICK_SPACING_MM / 1000.0
     ax.xaxis.set_major_locator(ticker.MultipleLocator(tick_m))
     ax.yaxis.set_major_locator(ticker.MultipleLocator(tick_m))
     ax.tick_params(which='major', length=4, width=0.8, colors="#555555",
                    labelsize=7, bottom=True, left=True, top=False, right=False)
     ax.grid(False)
-    ax.set_xlim(x_lo, x_hi); ax.set_ylim(y_lo, y_hi)
+    if ax_slice is not None and cfg.FLIP_HORIZONTAL.get(ax_slice, False):
+        ax.set_xlim(x_hi, x_lo)          # mirrored to match the sim exports
+    else:
+        ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(y_lo, y_hi)
     ax.set_aspect('equal', adjustable='box')
     ax.set_xlabel(h_label, fontsize=9, color="#333333")
     ax.set_ylabel(v_label, fontsize=9, color="#333333")
@@ -125,18 +162,18 @@ def make_slice_plot(cp_grid, mask, ax_slice, plane_idx, val_mm,
     cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
     cbar.set_label(scfg['label'], fontsize=8, color="#333333")
     cbar.ax.tick_params(labelsize=7, colors="#555555")
+    style_colorbar(cbar, scfg['vmin'], scfg['vmax'])
 
     valid    = cp_grid[~np.isnan(cp_grid)]
     fluid_px = int((~np.isnan(cp_grid) & ~mask).sum())
-    if valid.size:
-        rng = f"[{valid.min():.3f}, {valid.max():.3f}]"
-    else:
-        rng = "[no data]"
+    rng = (f"[{valid.min():.3f}, {valid.max():.3f}]" if valid.size
+           else "[no data]")
     title = (f"Plane {cfg.AXIS_LABEL[ax_slice]} #{plane_idx:03d}  {val_mm:+.1f} mm  "
              f"{scalar_key} {rng}  "
              f"({fluid_px:,} fluid px)")
 
-    _apply_axes(ax, x_lo, x_hi, y_lo, y_hi, h_label, v_label, title)
+    _apply_axes(ax, x_lo, x_hi, y_lo, y_hi, h_label, v_label, title,
+                ax_slice)
     return fig
 
 
@@ -175,7 +212,7 @@ def make_diff_plot(grid_a, grid_b, mask_a, mask_b,
     # Determine colormap range
     if fixed_range is not None:
         diff_abs  = float(fixed_range)
-        range_str = f"fixed +/-{diff_abs:.4f}"
+        range_str = f"fixed +/-{diff_abs:g}"
     else:
         diff_abs  = float(np.nanmax(np.abs(diff))) if not np.all(np.isnan(diff)) else 1.0
         diff_abs  = max(diff_abs, 1e-6)
@@ -196,6 +233,7 @@ def make_diff_plot(grid_a, grid_b, mask_a, mask_b,
     cbar.set_label(f"delta {scalar_key}  ({label_b} - {label_a})  [{range_str}]",
                    fontsize=8, color="#333333")
     cbar.ax.tick_params(labelsize=7, colors="#555555")
+    style_colorbar(cbar, -diff_abs, diff_abs)
 
     legend_elements = [
         Patch(facecolor='#404040', label='Geometry (both)'),
@@ -224,5 +262,6 @@ def make_diff_plot(grid_a, grid_b, mask_a, mask_b,
                  f"Plane {cfg.AXIS_LABEL[ax_slice]} #{plane_idx:03d}"
                  f"  {val_mm:+.1f} mm  (no data)")
 
-    _apply_axes(ax, x_lo, x_hi, y_lo, y_hi, h_label, v_label, title)
+    _apply_axes(ax, x_lo, x_hi, y_lo, y_hi, h_label, v_label, title,
+                ax_slice)
     return fig

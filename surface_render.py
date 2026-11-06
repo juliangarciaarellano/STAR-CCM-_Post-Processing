@@ -10,13 +10,19 @@
 
 surface_render.py
 =================
-Renders CFD surface data onto the geometry mesh.
+Renders CFD surface data on the CFD surface mesh itself — full nodes.
+
+Every output (PNG views, per-part views, 3D export, interactive HTML) uses
+the native CFD surface cells with their exact values: no nearest-cell
+mapping onto the CAD geometry, no decimation, no cell->point averaging.
+The geometry .case only supplies part names and a grey fallback for parts
+that have no surface data.
 
 Functions
 ---------
 prepare_surfaces(geom_case, surface_case, scalars=None)
-    -> list of (surf_mesh, edges_mesh, part_name)
-       Run once per dataset — KD-tree matching + edge extraction.
+    -> list of dicts {name, surf, edges}
+       Run once per dataset — loads full-node surfaces + edge extraction.
 
 render_views(prepared, scalar_key, cmap, clim,
              views=None, window_size=(1600,1000),
@@ -28,9 +34,14 @@ render_delta_views(prepared_a, prepared_b, scalar_key,
                    views=None, window_size=(1600,1000),
                    fixed_range=None, feature_angle=25)
     -> dict[view_name, numpy RGB image]
+    Run B is matched onto Run A cell-by-cell (exact when both runs share a
+    mesh; nearest cell when the geometry changed between runs).
 
 export_3d(prepared, scalar_keys, output_dir, fmt='vtp')
     Exports one file per part (VTP/VTK) or one merged file (STL/PLY/OBJ).
+
+export_interactive_html(prepared, scalar_key, ...)
+    Full-resolution Plotly HTML, one exact colour per CFD cell.
 
 VIEWS
 -----
@@ -52,6 +63,8 @@ import matplotlib.colors as mcolors
 from scipy.spatial import cKDTree
 import warnings
 warnings.filterwarnings('ignore')
+
+import config as cfg
 
 pv.global_theme.allow_empty_mesh = True
 
@@ -83,144 +96,132 @@ VIEW_WINDOW_SIZES = {
 
 EXPORT_FORMATS = ['vtp', 'vtk', 'stl', 'ply', 'obj']
 
+# FW + FW EPs -> 'Front wing',  RW + RW EPs -> 'Rear wing'
+MERGE_GROUPS = {
+    'Front wing': ['Front wing', 'Front wing EPs'],
+    'Rear wing':  ['Rear wing',  'Rear wing EPs'],
+}
+
 
 # ── Colourmap ─────────────────────────────────────────────────────
-def make_cp_cmap(mute=0.45, vmin=-4.0, vmax=1.0):
+def make_cp_cmap(mute=0.0, vmin=-4.0, vmax=1.0):
     """
-    STAR-CCM+ Cp palette desaturated toward gray.
-    mute=0.0 -> full saturation, mute=1.0 -> all gray.
-
-    Control points are defined as (position_0_to_1, r, g, b) where position
-    is a fraction of the full [vmin, vmax] range.  Grey is pinned at exactly
-    the position corresponding to Cp=0, regardless of vmin/vmax.
+    STAR-CCM+ Cp palette — same map as the Cp planes (config._make_cp_cmap).
+    mute=0.0 -> exact STAR colours (default), mute=1.0 -> all gray.
     """
-    # Position of Cp=0 in the normalised [0,1] range
-    zero_pos = (0.0 - vmin) / (vmax - vmin)   # e.g. 0.80 for vmin=-4, vmax=1
+    base = cfg._make_cp_cmap(vmin=vmin, vmax=vmax)
+    if mute <= 0:
+        return base
+    lut = base(np.linspace(0, 1, base.N))
+    gray = np.array([160, 160, 160, 255]) / 255.0
+    lut[:, :3] = lut[:, :3] * (1 - mute) + gray[:3] * mute
+    return mcolors.ListedColormap(lut, name='cp_surface_muted')
 
-    # Control points defined in normalised [0,1] space
-    # Negative half: 13 evenly spaced points from 0.0 to zero_pos (blue->grey)
-    # Positive half: proportional points from zero_pos to 1.0 (grey->red)
-    neg_colours = [
-        (  0,   0, 139),   # pos=0.000  deep blue
-        (  0,  50, 200),   # pos~0.133
-        (  0, 120, 240),   # pos~0.267
-        ( 30, 180, 230),   # pos~0.400
-        ( 50, 220, 180),   # pos~0.533
-        (100, 240, 100),   # pos~0.667
-        (180, 240,  60),   # pos~0.800
-        (240, 200,  50),   # pos~0.933  just below zero
-    ]
-    pos_colours = [
-        (240, 140,  30),   # just above zero
-        (220,  60,  10),
-        (160,  20,   5),
-        (120,  10,   5),   # pos=1.000  deep red
-    ]
 
-    # Build list of (position, r, g, b)
-    n_neg = len(neg_colours)
-    n_pos = len(pos_colours)
-    ctrl = []
-    for i, (r, g, b) in enumerate(neg_colours):
-        p = zero_pos * i / n_neg
-        ctrl.append((p, r, g, b))
-    ctrl.append((zero_pos, 185, 185, 185))   # grey exactly at Cp=0
-    for i, (r, g, b) in enumerate(pos_colours):
-        p = zero_pos + (1.0 - zero_pos) * (i + 1) / n_pos
-        ctrl.append((p, r, g, b))
+def _find_array(mesh, name):
+    """('cell'|'point', array_name) for an exact or partial array match."""
+    for where, data in (('cell', mesh.cell_data), ('point', mesh.point_data)):
+        if name in data:
+            return where, name
+    for where, data in (('cell', mesh.cell_data), ('point', mesh.point_data)):
+        for k in data.keys():
+            if name.lower() in k.lower() or k.lower() in name.lower():
+                return where, k
+    return None, None
 
-    gray = np.array([160, 160, 160])
-    muted = []
-    for p, r, g, b in ctrl:
-        # Pin grey exactly — don't blend
-        if abs(p - zero_pos) < 1e-9:
-            muted.append((p, 185, 185, 185))
-        else:
-            muted.append((p,
-                          int(r*(1-mute)+gray[0]*mute),
-                          int(g*(1-mute)+gray[1]*mute),
-                          int(b*(1-mute)+gray[2]*mute)))
 
-    cd = {k: [(muted[i][0], muted[i][j]/255, muted[i][j]/255)
-              for i in range(len(muted))]
-          for k, j in [('red',1), ('green',2), ('blue',3)]}
-    return mcolors.LinearSegmentedColormap('cp_surface', cd, N=512)
+def _colorbar(fig, ax, cmap, clim, label=None):
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mc
+    import plotting
+    sm = plt.cm.ScalarMappable(cmap=cmap,
+                               norm=mc.Normalize(vmin=clim[0], vmax=clim[1]))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02)
+    cbar.ax.tick_params(labelsize=8)
+    if label:
+        cbar.set_label(label, fontsize=9)
+    plotting.style_colorbar(cbar, clim[0], clim[1])
+    return cbar
 
 
 # ── Core preparation ──────────────────────────────────────────────
 def prepare_surfaces(geom_case, surface_case=None, scalars=None,
                      feature_angle=25):
     """
-    Load geometry and optionally surface CFD data.
-    Runs KD-tree matching and feature edge extraction once.
+    Load the CFD surface mesh (full nodes) and the geometry part names.
 
     Parameters
     ----------
-    geom_case    : str   path to geometry .case file
+    geom_case    : str   path to geometry .case file (part names + fallback)
     surface_case : str or None   path to surface CFD .case file
                    If None, renders geometry only (no scalar colouring).
-    scalars      : list of str or None   which arrays to transfer
+    scalars      : list of str or None   which arrays to keep
                    defaults to all available in surface_case
     feature_angle: float   angle threshold for feature edge extraction
 
     Returns
     -------
-    list of dicts, one per geometry part:
+    list of dicts, one per part:
         name    : str
-        surf    : pyvista PolyData   surface mesh with scalar cell_data
+        surf    : pyvista PolyData   CFD surface, native cells + cell_data
         edges   : pyvista PolyData or None   feature edges
+        source  : 'cfd' (full-node CFD surface) or 'geometry' (no data)
     """
+    import io_utils
     t0 = time.perf_counter()
     print("[surface_render] Loading geometry...")
+    io_utils.check_case(geom_case, 'Geometry')
     geom = pv.read(geom_case)
 
     surf_mesh = None
+    scalars_to_use = []
     if surface_case is not None:
-        print("[surface_render] Loading surface data...")
+        print("[surface_render] Loading surface data (full nodes)...")
+        io_utils.check_case(surface_case, 'Surface data')
         surf_mesh = pv.read(surface_case)
 
-        # Discover available scalars
         available = set()
         for i in range(surf_mesh.n_blocks):
             b = surf_mesh[i]
             if b is not None and b.n_cells > 0:
                 available.update(b.cell_data.keys())
+                available.update(b.point_data.keys())
         scalars_to_use = scalars if scalars else sorted(available)
         print(f"[surface_render] Scalars: {scalars_to_use}")
 
-    print("[surface_render] Preparing surfaces (KD-tree + edges)...")
+    print("[surface_render] Preparing surfaces (full nodes, no interpolation)...")
     prepared = []
+    n_blocks = geom.n_blocks
+    if surf_mesh is not None:
+        n_blocks = max(n_blocks, surf_mesh.n_blocks)
 
-    for i in range(geom.n_blocks):
-        g    = geom[i]
-        name = geom.get_block_name(i).strip()
-        if g is None or g.n_cells == 0:
+    for i in range(n_blocks):
+        g = geom[i] if i < geom.n_blocks else None
+        s = (surf_mesh[i] if surf_mesh is not None and i < surf_mesh.n_blocks
+             else None)
+        has_g = g is not None and g.n_cells > 0
+        has_s = s is not None and s.n_cells > 0
+        if not has_g and not has_s:
             continue
+        name = (geom.get_block_name(i) if has_g else
+                surf_mesh.get_block_name(i)) or f"Part {i}"
+        name = name.strip()
 
-        g_copy = g.copy()
+        if has_s:
+            surf = s.extract_surface(algorithm='dataset_surface')
+            # keep only the requested arrays (plus nothing interpolated)
+            for k in list(surf.cell_data.keys()):
+                if k not in scalars_to_use:
+                    surf.cell_data.remove(k)
+            for k in list(surf.point_data.keys()):
+                if k not in scalars_to_use:
+                    surf.point_data.remove(k)
+            source = 'cfd'
+        else:
+            surf = g.extract_surface(algorithm='dataset_surface')
+            source = 'geometry'
 
-        # Transfer scalars via KD-tree
-        if surf_mesh is not None:
-            s = surf_mesh[i]
-            if s is not None and s.n_cells > 0:
-                s_cc   = s.cell_centers().points
-                g_cc   = g.cell_centers().points
-                tree   = cKDTree(s_cc)
-                _, idx = tree.query(g_cc, k=1, workers=-1)
-
-                for skey in scalars_to_use:
-                    if skey in s.cell_data:
-                        g_copy.cell_data[skey] = s.cell_data[skey][idx]
-
-        # Extract surface
-        surf = g_copy.extract_surface(algorithm='dataset_surface')
-        if 'vtkOriginalCellIds' in surf.cell_data:
-            orig = surf.cell_data['vtkOriginalCellIds']
-            for skey in (scalars_to_use if surf_mesh else []):
-                if skey in g_copy.cell_data:
-                    surf.cell_data[skey] = g_copy.cell_data[skey][orig]
-
-        # Feature edges
         edges = surf.extract_feature_edges(
             boundary_edges=True, feature_edges=True,
             feature_angle=feature_angle,
@@ -228,16 +229,10 @@ def prepare_surfaces(geom_case, surface_case=None, scalars=None,
         )
         edges = edges if edges.n_cells > 0 else None
 
-        prepared.append(dict(name=name, surf=surf, edges=edges))
-        print(f"  {name}: {surf.n_cells:,} cells")
+        prepared.append(dict(name=name, surf=surf, edges=edges, source=source))
+        tag = "full nodes" if source == 'cfd' else "geometry only, no data"
+        print(f"  {name}: {surf.n_cells:,} cells  ({tag})")
 
-    # ── Merge related parts into logical groups ───────────────────
-    # FW + FW EPs -> 'Front wing'
-    # RW + RW EPs -> 'Rear wing'
-    MERGE_GROUPS = {
-        'Front wing': ['Front wing', 'Front wing EPs'],
-        'Rear wing':  ['Rear wing',  'Rear wing EPs'],
-    }
     prepared = _merge_parts(prepared, MERGE_GROUPS)
 
     print(f"[surface_render] Prepared {len(prepared)} parts "
@@ -253,41 +248,46 @@ def _merge_parts(prepared, groups):
     Parts not listed in any group are kept as-is.
     Parts that are consumed by a merge are removed from the output.
     """
+    # Case-insensitive: the UT26 export names the FW endplates 'Front Wing EPs'
+    def _norm(n):
+        return ' '.join(str(n).lower().split())
+
     consumed = set()
     merged_entries = []
 
     for group_name, members in groups.items():
-        parts_in_group = [p for p in prepared if p['name'] in members]
+        members_n = {_norm(m) for m in members}
+        parts_in_group = [p for p in prepared if _norm(p['name']) in members_n]
         if len(parts_in_group) < 2:
             continue  # nothing to merge
 
-        # Merge surfaces and edges
         all_surfs = [p['surf']  for p in parts_in_group]
         all_edges = [p['edges'] for p in parts_in_group if p['edges'] is not None]
 
-        merged_surf  = pv.merge(all_surfs)
+        merged_surf  = pv.merge(all_surfs, merge_points=False)
         merged_edges = pv.merge(all_edges) if all_edges else None
+        source = ('cfd' if all(p.get('source') == 'cfd' for p in parts_in_group)
+                  else 'geometry')
 
         merged_entries.append(dict(
             name=group_name,
             surf=merged_surf,
             edges=merged_edges,
+            source=source,
         ))
         for p in parts_in_group:
             consumed.add(p['name'])
-        print(f"  merged: {members} -> '{group_name}'")
+        print(f"  merged: {[p['name'] for p in parts_in_group]} -> '{group_name}'")
 
-    # Keep unconsumed parts, inserting merged groups at the position
-    # of the first consumed member
     result = []
     inserted = set()
     for p in prepared:
         if p['name'] not in consumed:
             result.append(p)
         else:
-            # Find which group this belongs to and insert it once
             for group_name, members in groups.items():
-                if p['name'] in members and group_name not in inserted:
+                if (_norm(p['name']) in {_norm(m) for m in members}
+                        and group_name not in inserted):
                     merged = next(e for e in merged_entries
                                   if e['name'] == group_name)
                     result.append(merged)
@@ -297,14 +297,54 @@ def _merge_parts(prepared, groups):
     return result
 
 
+def _add_scalar_mesh(pl, surf, scalar_key, cmap, clim, part_name='?'):
+    """Add one part coloured by its own (cell or node) values."""
+    where, arr = _find_array(surf, scalar_key)
+    if where is not None:
+        pl.add_mesh(surf, scalars=arr, preference=where,
+                    cmap=cmap, clim=list(clim),
+                    smooth_shading=False, interpolate_before_map=False,
+                    show_scalar_bar=False, lighting=False, show_edges=False)
+        return True
+    print(f"  [WARN] '{scalar_key}' not found on '{part_name}'"
+          f" — check Surface data .case path is set in the GUI")
+    pl.add_mesh(surf, color='#aaaaaa',
+                smooth_shading=True, lighting=True,
+                ambient=0.4, show_edges=False)
+    return False
+
+
+def _fit_camera(pl, parts, pos, focal, up, wsize, target_fill=0.85):
+    """Point the camera along the view direction and zoom to fill."""
+    import vtk as _vtk
+    pl.view_vector(vector=tuple(p - f for p, f in zip(pos, focal)), viewup=up)
+    pl.reset_camera()
+    all_bounds = np.array([p['surf'].bounds for p in parts])
+    wmin = all_bounds[:, [0, 2, 4]].min(axis=0)
+    wmax = all_bounds[:, [1, 3, 5]].max(axis=0)
+    corners = np.array([[x, y, z] for x in [wmin[0], wmax[0]]
+                                   for y in [wmin[1], wmax[1]]
+                                   for z in [wmin[2], wmax[2]]])
+    coord = _vtk.vtkCoordinate()
+    coord.SetCoordinateSystemToWorld()
+    spts = []
+    for pt in corners:
+        coord.SetValue(*pt)
+        spts.append(coord.GetComputedDisplayValue(pl.renderer)[:2])
+    spts = np.array(spts, dtype=float)
+    W, H = wsize
+    fill = max((spts[:, 0].max() - spts[:, 0].min()) / W,
+               (spts[:, 1].max() - spts[:, 1].min()) / H)
+    if fill > 0:
+        pl.camera.zoom(target_fill / fill)
+
+
 def _render_one_view(parts, scalar_key, cmap, clim,
                      vname, window_size, edge_color, edge_width,
                      bg_color, zoom=False, zoom_factor=1.8):
     """
     Render a single view of the given parts list.
-    If zoom=True, uses reset_camera() then zooms in so the part fills
-    ~85% of the shorter window dimension, correcting for aspect ratio.
-    zoom_factor is ignored when zoom=True — fill logic takes over.
+    If zoom=True, the parts fill ~85% of the window (aspect-corrected).
     Returns RGB numpy array.
     """
     pos, focal, up = VIEWS[vname]
@@ -314,65 +354,14 @@ def _render_one_view(parts, scalar_key, cmap, clim,
     pl.set_background(bg_color)
 
     for part in parts:
-        surf  = part['surf']
-        edges = part['edges']
-        if scalar_key in surf.cell_data:
-            pl.add_mesh(surf, scalars=scalar_key, preference='cell',
-                        cmap=cmap, clim=list(clim),
-                        smooth_shading=False, interpolate_before_map=True,
-                        show_scalar_bar=False, lighting=False, show_edges=False)
-        else:
-            # Scalar missing — surface_case was not loaded or array not found
-            # Print a warning so the user knows which part is missing data
-            print(f"  [WARN] '{scalar_key}' not found on '{parts[0].get('name','?') if len(parts)==1 else 'merged'}'"
-                  f" — check Surface data .case path is set in the GUI")
-            pl.add_mesh(surf, color='#aaaaaa',
-                        smooth_shading=True, lighting=True,
-                        ambient=0.4, show_edges=False)
-        if edges is not None:
-            pl.add_mesh(edges, color=edge_color,
+        _add_scalar_mesh(pl, part['surf'], scalar_key, cmap, clim,
+                         part.get('name', '?'))
+        if part['edges'] is not None:
+            pl.add_mesh(part['edges'], color=edge_color,
                         line_width=edge_width, lighting=False)
 
     if zoom:
-        # Step 1: set view direction and fit camera to content
-        pl.view_vector(
-            vector=tuple(p - f for p, f in zip(pos, focal)),
-            viewup=up
-        )
-        pl.reset_camera()
-
-        # Step 2: compute projected screen bounds to calculate fill ratio
-        import numpy as np
-        import vtk as _vtk
-        all_bounds = np.array([p['surf'].bounds for p in parts])
-        world_min = all_bounds[:, [0,2,4]].min(axis=0)
-        world_max = all_bounds[:, [1,3,5]].max(axis=0)
-        corners_3d = np.array([[x,y,z]
-            for x in [world_min[0],world_max[0]]
-            for y in [world_min[1],world_max[1]]
-            for z in [world_min[2],world_max[2]]])
-
-        coord = _vtk.vtkCoordinate()
-        coord.SetCoordinateSystemToWorld()
-        screen_pts = []
-        for pt in corners_3d:
-            coord.SetValue(*pt)
-            sp = coord.GetComputedDisplayValue(pl.renderer)
-            screen_pts.append(sp[:2])
-        screen_pts = np.array(screen_pts, dtype=float)
-
-        W, H = wsize
-        pt_w = screen_pts[:,0].max() - screen_pts[:,0].min()
-        pt_h = screen_pts[:,1].max() - screen_pts[:,1].min()
-
-        fill_w = pt_w / W
-        fill_h = pt_h / H
-
-        TARGET_FILL = 0.85
-        current_fill = max(fill_w, fill_h)
-        if current_fill > 0:
-            zoom_in = TARGET_FILL / current_fill
-            pl.camera.zoom(zoom_in)
+        _fit_camera(pl, parts, pos, focal, up, wsize)
     else:
         pl.camera.position    = pos
         pl.camera.focal_point = focal
@@ -383,12 +372,25 @@ def _render_one_view(parts, scalar_key, cmap, clim,
     return img
 
 
+def _save_view_png(img, cmap, clim, title, out_path, bg_color, label=None):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(12, 7), facecolor=bg_color)
+    ax.imshow(img); ax.axis('off')
+    _colorbar(fig, ax, cmap, clim, label)
+    ax.set_title(title, fontsize=11,
+                 color='black' if bg_color == 'white' else 'white')
+    fig.savefig(out_path, dpi=150, facecolor=bg_color, bbox_inches='tight')
+    plt.close(fig)
+
+
 # ── Single-run render ─────────────────────────────────────────────
-def render_views(prepared, scalar_key, cmap=None, clim=(-3.0, 1.0),
+def render_views(prepared, scalar_key, cmap=None, clim=(-4.0, 1.0),
                  views=None, window_size=(1600, 1000),
                  edge_color='black', edge_width=0.8,
                  bg_color='white',
-                 output_dir=None, file_stem='surface'):
+                 output_dir=None, file_stem='surface', label=None):
     """
     Render a set of views for a single run.
     Saves one PNG per view if output_dir is provided.
@@ -401,9 +403,6 @@ def render_views(prepared, scalar_key, cmap=None, clim=(-3.0, 1.0),
     clim        : (vmin, vmax)
     views       : list of view name strings or None (all views)
     window_size : (W, H)
-    edge_color  : str
-    edge_width  : float
-    bg_color    : str
     output_dir  : str or None   if set, saves individual PNGs here
     file_stem   : str           prefix for output filenames
 
@@ -416,7 +415,9 @@ def render_views(prepared, scalar_key, cmap=None, clim=(-3.0, 1.0),
     views_to_render = views or list(VIEWS.keys())
 
     png_dir = os.path.join(output_dir, 'PNG') if output_dir else None
+    npz_dir = os.path.join(output_dir, 'NPZ') if output_dir else None
     if png_dir: os.makedirs(png_dir, exist_ok=True)
+    if npz_dir: os.makedirs(npz_dir, exist_ok=True)
 
     imgs = {}
     for vname in views_to_render:
@@ -426,30 +427,26 @@ def render_views(prepared, scalar_key, cmap=None, clim=(-3.0, 1.0),
         t0  = time.perf_counter()
         img = _render_one_view(prepared, scalar_key, cmap, clim,
                                vname, window_size, edge_color, edge_width,
-                               bg_color, zoom=True)   # fill logic for all views
+                               bg_color, zoom=True)
         imgs[vname] = img
 
         if output_dir:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            import matplotlib.colors as mc
-
-            # ── PNG ──────────────────────────────────────────────
-            fig, ax = plt.subplots(figsize=(12, 7), facecolor=bg_color)
-            ax.imshow(img); ax.axis('off')
-            sm = plt.cm.ScalarMappable(cmap=cmap,
-                 norm=mc.Normalize(vmin=clim[0], vmax=clim[1]))
-            sm.set_array([])
-            cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02)
-            cbar.ax.tick_params(labelsize=8)
-            ax.set_title(f'{file_stem}  --  {vname.replace("_"," ").title()}',
-                         fontsize=11, color='black' if bg_color=='white' else 'white')
             out_path = os.path.join(png_dir, f'{file_stem}_{vname}.png')
-            fig.savefig(out_path, dpi=150, facecolor=bg_color,
-                        bbox_inches='tight')
-            plt.close(fig)
+            _save_view_png(img, cmap, clim,
+                           f'{file_stem}  --  {vname.replace("_"," ").title()}',
+                           out_path, bg_color, label)
             print(f"  saved: PNG/{os.path.basename(out_path)}")
+
+            npz_path = os.path.join(npz_dir, f'{file_stem}_{vname}.npz')
+            np.savez_compressed(
+                npz_path,
+                image      = img.astype(np.uint8),
+                view       = np.bytes_(vname),
+                scalar_key = np.bytes_(scalar_key),
+                clim       = np.array(clim, dtype=np.float32),
+                file_stem  = np.bytes_(file_stem),
+            )
+            print(f"  saved: NPZ/{os.path.basename(npz_path)}")
 
         print(f"  {vname}: {time.perf_counter()-t0:.1f}s")
 
@@ -457,22 +454,15 @@ def render_views(prepared, scalar_key, cmap=None, clim=(-3.0, 1.0),
 
 
 def render_part_views(prepared, part_names, scalar_key,
-                      cmap=None, clim=(-3.0, 1.0),
+                      cmap=None, clim=(-4.0, 1.0),
                       views=None, window_size=(1600, 1000),
                       edge_color='black', edge_width=0.8,
                       bg_color='white',
                       output_dir=None, file_stem='surface',
-                      zoom_factor=1.4):
+                      zoom_factor=1.4, label=None):
     """
     Render individual views for each requested part, auto-zoomed to fit.
     Saves one PNG per (part, view) combination.
-
-    Parameters
-    ----------
-    part_names  : list of str   part names to render individually
-                  must match the 'name' keys in prepared
-    output_dir  : str or None   where to save PNGs
-    file_stem   : str           prefix e.g. 'surface_Cp'
 
     Returns
     -------
@@ -483,9 +473,10 @@ def render_part_views(prepared, part_names, scalar_key,
     views_to_render = views or list(VIEWS.keys())
 
     png_dir = os.path.join(output_dir, 'PNG') if output_dir else None
+    npz_dir = os.path.join(output_dir, 'NPZ') if output_dir else None
     if png_dir: os.makedirs(png_dir, exist_ok=True)
+    if npz_dir: os.makedirs(npz_dir, exist_ok=True)
 
-    # Build name -> part lookup
     part_lookup = {p['name']: p for p in prepared}
 
     results = {}
@@ -495,41 +486,37 @@ def render_part_views(prepared, part_names, scalar_key,
             continue
 
         part = part_lookup[pname]
-        parts_single = [part]
         safe_name = pname.replace(' ', '_').replace('/', '_')
 
         for vname in views_to_render:
             if vname not in VIEWS:
                 continue
             t0  = time.perf_counter()
-            img = _render_one_view(parts_single, scalar_key, cmap, clim,
+            img = _render_one_view([part], scalar_key, cmap, clim,
                                    vname, window_size, edge_color, edge_width,
                                    bg_color, zoom=True, zoom_factor=zoom_factor)
             results[(pname, vname)] = img
 
             if output_dir:
-                import matplotlib
-                matplotlib.use('Agg')
-                import matplotlib.pyplot as plt
-                import matplotlib.colors as mc
-
-                # ── PNG ──────────────────────────────────────────
-                fig, ax = plt.subplots(figsize=(12, 7), facecolor=bg_color)
-                ax.imshow(img); ax.axis('off')
-                sm = plt.cm.ScalarMappable(cmap=cmap,
-                     norm=mc.Normalize(vmin=clim[0], vmax=clim[1]))
-                sm.set_array([])
-                cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02)
-                cbar.ax.tick_params(labelsize=8)
-                ax.set_title(f'{pname}  --  {vname.replace("_"," ").title()}',
-                             fontsize=11,
-                             color='black' if bg_color=='white' else 'white')
                 out_path = os.path.join(png_dir,
                                         f'{file_stem}_{safe_name}_{vname}.png')
-                fig.savefig(out_path, dpi=150, facecolor=bg_color,
-                            bbox_inches='tight')
-                plt.close(fig)
+                _save_view_png(img, cmap, clim,
+                               f'{pname}  --  {vname.replace("_"," ").title()}',
+                               out_path, bg_color, label)
                 print(f"  saved: PNG/{os.path.basename(out_path)}")
+
+                npz_path = os.path.join(npz_dir,
+                                        f'{file_stem}_{safe_name}_{vname}.npz')
+                np.savez_compressed(
+                    npz_path,
+                    image      = img.astype(np.uint8),
+                    view       = np.bytes_(vname),
+                    part_name  = np.bytes_(pname),
+                    scalar_key = np.bytes_(scalar_key),
+                    clim       = np.array(clim, dtype=np.float32),
+                    file_stem  = np.bytes_(file_stem),
+                )
+                print(f"  saved: NPZ/{os.path.basename(npz_path)}")
 
             print(f"  {pname} / {vname}: {time.perf_counter()-t0:.1f}s")
 
@@ -541,8 +528,7 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
                        label_a='Run A', label_b='Run B',
                        views=None, window_size=(1600, 1000),
                        fixed_range=None, feature_angle=25,
-                       bg_color='white',
-                       output_dir=None, file_stem='surface_delta'):
+                       bg_color='white'):
     """
     Render delta views (B - A) with three-colour geometry overlay.
 
@@ -551,29 +537,21 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
       Magenta (#CC00CC) — new in B
       Brown   (#8B4513) — removed (only in A)
 
-    Parameters
-    ----------
-    prepared_a/b : lists from prepare_surfaces()
-    scalar_key   : str
-    fixed_range  : float or None   symmetric clim for delta colormap
-    views        : list of str or None
-    output_dir   : str or None   if set, saves one PNG per view
-                   under a PNG/ subdirectory
-    file_stem    : str           prefix for output filenames
+    Cells are matched A -> B by cell centre. When both runs share the same
+    surface mesh this is an exact 1:1 match; when the geometry changed it is
+    the nearest CFD cell of run B.
 
     Returns
     -------
-    dict[view_name, np.ndarray], clim
+    (dict[view_name, np.ndarray], clim)
     """
     views_to_render = views or list(VIEWS.keys())
 
-    # Build name->part lookup
     parts_a = {p['name']: p for p in prepared_a}
     parts_b = {p['name']: p for p in prepared_b}
     all_names = sorted(set(parts_a.keys()) | set(parts_b.keys()))
 
-    # Compute per-part delta meshes and geometry overlay
-    delta_parts  = []   # (surf_with_delta, edges, geom_color)
+    delta_parts  = []
     GRAY    = '#404040'
     MAGENTA = '#CC00CC'
     BROWN   = '#8B4513'
@@ -584,22 +562,29 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
 
         if pa is not None and pb is not None:
             geom_color = GRAY
-            # Compute delta — requires matching cells
-            if (scalar_key in pa['surf'].cell_data and
-                    scalar_key in pb['surf'].cell_data):
-                va = pa['surf'].cell_data[scalar_key]
-                vb = pb['surf'].cell_data[scalar_key]
-                # Match by cell centre KD-tree
+            wa, ka = _find_array(pa['surf'], scalar_key)
+            wb, kb = _find_array(pb['surf'], scalar_key)
+            surf_d = pa['surf'].copy()
+            edges  = pa['edges']
+            if wa == 'cell' and wb == 'cell':
+                va = pa['surf'].cell_data[ka]
+                vb = pb['surf'].cell_data[kb]
                 cc_a = pa['surf'].cell_centers().points
                 cc_b = pb['surf'].cell_centers().points
-                _, idx = cKDTree(cc_b).query(cc_a, k=1, workers=-1)
-                delta = vb[idx] - va
-                surf_d = pa['surf'].copy()
-                surf_d.cell_data['delta'] = delta
-                edges = pa['edges']
-            else:
-                surf_d = pa['surf'].copy()
-                edges  = pa['edges']
+                if len(cc_a) == len(cc_b) and np.allclose(cc_a, cc_b, atol=1e-9):
+                    idx = np.arange(len(cc_a))              # same mesh: exact
+                else:
+                    _, idx = cKDTree(cc_b).query(cc_a, k=1, workers=-1)
+                surf_d.cell_data['delta'] = vb[idx] - va
+            elif wa == 'point' and wb == 'point':
+                va = pa['surf'].point_data[ka]
+                vb = pb['surf'].point_data[kb]
+                pa_pts, pb_pts = pa['surf'].points, pb['surf'].points
+                if len(pa_pts) == len(pb_pts) and np.allclose(pa_pts, pb_pts, atol=1e-9):
+                    idx = np.arange(len(pa_pts))
+                else:
+                    _, idx = cKDTree(pb_pts).query(pa_pts, k=1, workers=-1)
+                surf_d.point_data['delta'] = vb[idx] - va
 
         elif pb is not None:
             geom_color = MAGENTA
@@ -610,18 +595,20 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
             surf_d = pa['surf'].copy()
             edges  = pa['edges']
 
+        where = ('cell' if 'delta' in surf_d.cell_data else
+                 'point' if 'delta' in surf_d.point_data else None)
         delta_parts.append(dict(
             surf=surf_d, edges=edges,
             geom_color=geom_color,
-            has_delta=('delta' in surf_d.cell_data),
+            has_delta=where is not None, where=where,
         ))
 
-    # Auto-range if needed
     if fixed_range is None:
         all_deltas = []
         for p in delta_parts:
             if p['has_delta']:
-                all_deltas.append(p['surf'].cell_data['delta'])
+                data = p['surf'].cell_data if p['where'] == 'cell' else p['surf'].point_data
+                all_deltas.append(np.asarray(data['delta']))
         if all_deltas:
             dmax = float(np.nanmax(np.abs(np.concatenate(all_deltas))))
             clim = (-dmax, dmax)
@@ -629,9 +616,6 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
             clim = (-1.0, 1.0)
     else:
         clim = (-fixed_range, fixed_range)
-
-    png_dir = os.path.join(output_dir, 'PNG') if output_dir else None
-    if png_dir: os.makedirs(png_dir, exist_ok=True)
 
     imgs = {}
     for vname in views_to_render:
@@ -647,10 +631,11 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
 
         for part in delta_parts:
             if part['has_delta']:
-                pl.add_mesh(part['surf'], scalars='delta', preference='cell',
+                pl.add_mesh(part['surf'], scalars='delta',
+                            preference=part['where'],
                             cmap='RdBu_r', clim=list(clim),
                             smooth_shading=False,
-                            interpolate_before_map=True,
+                            interpolate_before_map=False,
                             show_scalar_bar=False,
                             lighting=False, show_edges=False)
             else:
@@ -662,60 +647,9 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
                 pl.add_mesh(part['edges'], color='black',
                             line_width=0.8, lighting=False)
 
-        # Fill-based zoom
-        pl.view_vector(tuple(p-f for p,f in zip(pos,focal)), viewup=up)
-        pl.reset_camera()
-        import vtk as _vtk
-        all_bounds = np.array([p['surf'].bounds for p in delta_parts])
-        wmin = all_bounds[:,[0,2,4]].min(axis=0)
-        wmax = all_bounds[:,[1,3,5]].max(axis=0)
-        corners = np.array([[x,y,z] for x in [wmin[0],wmax[0]]
-                                     for y in [wmin[1],wmax[1]]
-                                     for z in [wmin[2],wmax[2]]])
-        coord = _vtk.vtkCoordinate()
-        coord.SetCoordinateSystemToWorld()
-        spts = []
-        for pt in corners:
-            coord.SetValue(*pt)
-            spts.append(coord.GetComputedDisplayValue(pl.renderer)[:2])
-        spts = np.array(spts, dtype=float)
-        W, H = wsize
-        fill = max((spts[:,0].max()-spts[:,0].min())/W,
-                   (spts[:,1].max()-spts[:,1].min())/H)
-        if fill > 0:
-            pl.camera.zoom(0.85 / fill)
-
-        img = pl.screenshot(None, return_img=True)
-        imgs[vname] = img
+        _fit_camera(pl, delta_parts, pos, focal, up, wsize)
+        imgs[vname] = pl.screenshot(None, return_img=True)
         pl.close()
-
-        if output_dir:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            import matplotlib.colors as mc
-
-            # ── PNG ──────────────────────────────────────────────
-            fig, ax = plt.subplots(figsize=(12, 7), facecolor=bg_color)
-            ax.imshow(img); ax.axis('off')
-            sm = plt.cm.ScalarMappable(cmap='RdBu_r',
-                 norm=mc.Normalize(vmin=clim[0], vmax=clim[1]))
-            sm.set_array([])
-            cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02)
-            cbar.ax.tick_params(labelsize=8)
-            cbar.set_label(f'delta {scalar_key}  ({label_b} - {label_a})',
-                           fontsize=9)
-            ax.set_title(
-                f'{file_stem}  --  {vname.replace("_"," ").title()}'
-                f'   ({label_b} - {label_a})',
-                fontsize=11,
-                color='black' if bg_color == 'white' else 'white')
-            out_path = os.path.join(png_dir, f'{file_stem}_{vname}.png')
-            fig.savefig(out_path, dpi=150, facecolor=bg_color,
-                        bbox_inches='tight')
-            plt.close(fig)
-            print(f"  saved: PNG/{os.path.basename(out_path)}")
-
         print(f"  {vname}: {time.perf_counter()-t0:.1f}s")
 
     return imgs, clim
@@ -725,7 +659,7 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
 def export_3d(prepared, scalar_keys=None, output_dir='.',
               fmt='vtp', merged=False):
     """
-    Export prepared surface meshes to a 3D file format.
+    Export prepared (full-node) surface meshes to a 3D file format.
 
     Parameters
     ----------
@@ -735,7 +669,6 @@ def export_3d(prepared, scalar_keys=None, output_dir='.',
     output_dir  : str
     fmt         : str   one of 'vtp', 'vtk', 'stl', 'ply', 'obj'
     merged      : bool  if True, merge all parts into one file
-                        if False, one file per part (recommended for VTP/VTK)
 
     Returns
     -------
@@ -749,20 +682,21 @@ def export_3d(prepared, scalar_keys=None, output_dir='.',
     scalar_supports = fmt in ('vtp', 'vtk')
     exported = []
 
+    def _strip(s):
+        for key in list(s.cell_data.keys()):
+            s.cell_data.remove(key)
+        for key in list(s.point_data.keys()):
+            s.point_data.remove(key)
+
     if merged:
-        # Single merged file — geometry only for STL/PLY/OBJ
         all_surfs = []
         for part in prepared:
             s = part['surf'].copy()
             if not scalar_supports:
-                # Strip all data arrays
-                for key in list(s.cell_data.keys()):
-                    s.cell_data.remove(key)
-                for key in list(s.point_data.keys()):
-                    s.point_data.remove(key)
+                _strip(s)
             all_surfs.append(s)
 
-        merged_mesh = pv.merge(all_surfs)
+        merged_mesh = pv.merge(all_surfs, merge_points=False)
         out_path = os.path.join(output_dir, f'surface_merged.{fmt}')
         merged_mesh.save(out_path)
         size_mb = os.path.getsize(out_path) / 1e6
@@ -770,22 +704,19 @@ def export_3d(prepared, scalar_keys=None, output_dir='.',
         exported.append(out_path)
 
     else:
-        # One file per part
         for part in prepared:
             s    = part['surf'].copy()
             name = part['name'].replace(' ', '_').replace('/', '_')
 
             if not scalar_supports:
+                _strip(s)
+            elif scalar_keys is not None:
                 for key in list(s.cell_data.keys()):
-                    s.cell_data.remove(key)
+                    if key not in scalar_keys and key != 'vtkOriginalCellIds':
+                        s.cell_data.remove(key)
                 for key in list(s.point_data.keys()):
-                    s.point_data.remove(key)
-            else:
-                # Keep only requested scalars
-                if scalar_keys is not None:
-                    for key in list(s.cell_data.keys()):
-                        if key not in scalar_keys and key != 'vtkOriginalCellIds':
-                            s.cell_data.remove(key)
+                    if key not in scalar_keys:
+                        s.point_data.remove(key)
 
             out_path = os.path.join(output_dir, f'{name}.{fmt}')
             s.save(out_path)
@@ -798,24 +729,15 @@ def export_3d(prepared, scalar_keys=None, output_dir='.',
 
 # ── Interactive HTML export ───────────────────────────────────────
 def export_interactive_html(prepared, scalar_key, cmap=None,
-                            clim=(-3.0, 1.0), label='Cp',
-                            output_path='surface.html',
-                            triangles_per_part=60_000):
+                            clim=(-4.0, 1.0), label='Cp',
+                            output_path='surface.html'):
     """
-    Export an interactive Plotly 3D HTML file.
-    Opens in any browser — no software installation required.
-    Drag to rotate, scroll to zoom, click legend to toggle parts.
+    Export an interactive Plotly 3D HTML file at full resolution.
 
-    Parameters
-    ----------
-    prepared          : list from prepare_surfaces()
-    scalar_key        : str   array name to colour by
-    cmap              : matplotlib colormap or None (uses make_cp_cmap())
-    clim              : (vmin, vmax)
-    label             : str   colorbar label
-    output_path       : str   path to .html output file
-    triangles_per_part: int   decimate each part to this many triangles
-                              for browser performance (default 60_000)
+    Every CFD surface cell is kept (no decimation) and coloured by its own
+    value (Plotly intensitymode='cell' — no cell->point averaging). Polygons
+    are split into triangles that each carry their parent cell's value.
+    Large surfaces give large files; the size is printed when done.
 
     Returns
     -------
@@ -829,59 +751,49 @@ def export_interactive_html(prepared, scalar_key, cmap=None,
     if cmap is None:
         cmap = make_cp_cmap(vmin=clim[0], vmax=clim[1])
 
-    # Build Plotly colorscale from matplotlib colormap
     vmin, vmax = clim
-    positions  = np.linspace(0, 1, 64)
+    positions  = np.linspace(0, 1, 256)
     rgba       = cmap(positions)
-    colorscale = [[float(p), f'rgb({int(r*255)},{int(g*255)},{int(b*255)})']
+    colorscale = [[float(p), f'rgb({int(round(r*255))},{int(round(g*255))},{int(round(b*255))})']
                   for p, (r, g, b, _) in zip(positions, rgba)]
 
-    print(f"[surface_render] Building interactive HTML "
-          f"({triangles_per_part:,} tris/part)...")
+    print("[surface_render] Building interactive HTML (full nodes, every cell)...")
     traces = []
     first  = True
+    n_total = 0
 
     for part in prepared:
         surf = part['surf']
         name = part['name']
-        if scalar_key not in surf.cell_data:
+        where, arr = _find_array(surf, scalar_key)
+        if where is None:
             continue
 
         t0 = time.perf_counter()
-
-        # Copy only the scalar we need
         s = surf.copy()
         for k in list(s.cell_data.keys()):
-            if k != scalar_key:
+            if k != arr:
                 s.cell_data.remove(k)
+        for k in list(s.point_data.keys()):
+            if k != arr:
+                s.point_data.remove(k)
 
-        # Fast grid-based simplification via vtkQuadricClustering
-        # Works on mixed cell types (quads + tris), no triangulation needed
-        # Target ~triangles_per_part cells by tuning grid divisions
-        import vtk as _vtk
-        divisions = max(30, int((triangles_per_part / 3) ** (1/2)))
-        qc = _vtk.vtkQuadricClustering()
-        qc.SetInputData(s)
-        qc.SetNumberOfDivisions(divisions, divisions, divisions)
-        qc.AutoAdjustNumberOfDivisionsOn()
-        qc.Update()
-        simplified = pv.wrap(qc.GetOutput())
+        tri   = s.triangulate()                    # cell data copied per triangle
+        pts   = np.asarray(tri.points, dtype=np.float32)
+        faces = tri.faces.reshape(-1, 4)[:, 1:].astype(np.int32)
 
-        # Triangulate the simplified mesh for Plotly (needs triangles)
-        tri    = simplified.triangulate()
-        pts    = tri.points
-        faces  = tri.faces.reshape(-1, 4)[:, 1:]
-
-        # cell_data_to_point_data for smooth vertex colours
-        tri_pt  = tri.cell_data_to_point_data()
-        pt_vals = tri_pt.point_data.get(
-            scalar_key, np.zeros(len(pts), dtype=np.float32)
-        ).astype(np.float32)
+        if where == 'cell':
+            intensity = np.asarray(tri.cell_data[arr], dtype=np.float32)
+            imode = 'cell'
+        else:
+            intensity = np.asarray(tri.point_data[arr], dtype=np.float32)
+            imode = 'vertex'
 
         trace = go.Mesh3d(
             x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
             i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-            intensity=pt_vals,
+            intensity=intensity,
+            intensitymode=imode,
             colorscale=colorscale,
             cmin=vmin, cmax=vmax,
             showscale=first,
@@ -892,19 +804,21 @@ def export_interactive_html(prepared, scalar_key, cmap=None,
             ) if first else None,
             name=name,
             lighting=dict(ambient=0.9, diffuse=0.1, specular=0.0),
-            flatshading=False,
+            flatshading=True,
             hovertemplate=(f'<b>{name}</b><br>'
                            f'{label}: %{{intensity:.3f}}<extra></extra>'),
             showlegend=True,
         )
         traces.append(trace)
         first = False
-        print(f"  {name}: {len(faces):,} tris  ({time.perf_counter()-t0:.1f}s)")
+        n_total += len(faces)
+        print(f"  {name}: {s.n_cells:,} cells -> {len(faces):,} tris  "
+              f"({time.perf_counter()-t0:.1f}s)")
 
     fig = go.Figure(data=traces)
     fig.update_layout(
         title=dict(
-            text=(f'UT26 — Surface {label}  |  '
+            text=(f'UT26 — Surface {label}  (full mesh)  |  '
                   f'drag to rotate  ·  scroll to zoom  ·  '
                   f'click legend to toggle parts'),
             font=dict(size=13)),
@@ -930,5 +844,9 @@ def export_interactive_html(prepared, scalar_key, cmap=None,
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     fig.write_html(output_path, include_plotlyjs='cdn')
     size_mb = os.path.getsize(output_path) / 1e6
-    print(f"[surface_render] Saved interactive HTML -> {output_path}  ({size_mb:.1f}MB)")
+    print(f"[surface_render] Saved interactive HTML -> {output_path}  "
+          f"({size_mb:.1f}MB, {n_total:,} triangles)")
+    if size_mb > 200:
+        print("  [NOTE] Large file — very big HTML files can be slow to open "
+              "in a browser. Chrome/Edge handle them best.")
     return output_path

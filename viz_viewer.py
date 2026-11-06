@@ -187,12 +187,6 @@ class Viewer(tk.Tk):
         self.v_scalar = tk.StringVar()
         self.v_axis = tk.StringVar()
 
-        # Diff stats loaded from comparison_summary.csv (written by compare.py).
-        # Indexed by (scalar, axis, plane_idx) -> row dict. Populated on Load.
-        self.stats_rows = {}
-        self.stats_csv_path = None
-        self.stats_labels = ("Run A", "Run B")
-
         self._build_header()
         self._build_paths()
         self._build_nav()
@@ -273,20 +267,8 @@ class Viewer(tk.Tk):
         self.counter = tk.Label(nav, text="0 / 0", font=FONT_B, bg=BG_D,
                                 fg="#555")
         self.counter.pack(side="right", padx=PAD)
-        self.btn_stats = tk.Button(nav, text="Diff Stats",
-                                   command=self._show_stats_popup, **BTN_SEC)
-        self.btn_stats.pack(side="right", padx=PAD, pady=PAD_SM)
 
     def _build_panes(self):
-        # Thin strip showing the current slice's diff stats, updated on scroll.
-        strip = tk.Frame(self, bg="#eef3f8")
-        strip.pack(fill="x", padx=PAD, pady=(PAD_SM, 0))
-        self.stats_strip = tk.Label(
-            strip, text="Diff stats: load a Delta folder containing "
-                        "comparison_summary.csv",
-            font=FONT_M, bg="#eef3f8", fg="#555", anchor="w", justify="left")
-        self.stats_strip.pack(side="left", padx=PAD, pady=PAD_SM)
-
         self.body = tk.Frame(self, bg=BG)
         self.body.pack(fill="both", expand=True, padx=PAD, pady=PAD)
         self.body.rowconfigure(0, weight=1)
@@ -355,7 +337,6 @@ class Viewer(tk.Tk):
             return
         for s in SETS:
             self.trees[s] = _index(self.dirs[s].get().strip())
-        self._load_stats()
         scalars = sorted({sc for t in self.trees.values() for sc in t})
         if not scalars:
             self.status.config(text="No PNG/<scalar>/<axis> images found.")
@@ -412,150 +393,11 @@ class Viewer(tk.Tk):
     def _on_wheel(self, event):
         self._step(-1 if event.delta > 0 else 1)
 
-    # ── diff stats from comparison_summary.csv ───────────────────────
-    def _find_stats_csv(self):
-        """
-        Locate comparison_summary.csv. The compare pipeline writes it at the
-        root of the comparison output dir (the same dir that contains PNG/).
-        Check, in order: the Delta folder and its parent, then New, then
-        Parent; accept either the dir the user picked or its PNG parent.
-        """
-        seen = []
-        for s in ("delta", "new", "parent"):
-            raw = self.dirs[s].get().strip()
-            if not raw or not os.path.isdir(raw):
-                continue
-            base = os.path.normpath(raw)
-            # If they pointed at PNG/, the CSV is one level up.
-            parents = [base]
-            if os.path.basename(base).upper() == "PNG":
-                parents.append(os.path.dirname(base))
-            else:
-                parents.append(os.path.dirname(base))  # also try one up
-            for d in parents:
-                cand = os.path.join(d, "comparison_summary.csv")
-                if cand not in seen:
-                    seen.append(cand)
-                if os.path.isfile(cand):
-                    return cand
-        return None
-
-    def _load_stats(self):
-        """Read comparison_summary.csv into an index keyed by
-        (scalar, axis, plane_idx)."""
-        import csv as _csv
-        self.stats_rows = {}
-        self.stats_csv_path = self._find_stats_csv()
-        if not self.stats_csv_path:
-            return
-        try:
-            with open(self.stats_csv_path, newline='') as f:
-                for row in _csv.DictReader(f):
-                    try:
-                        pidx = int(float(row.get('plane_idx', '')))
-                    except (TypeError, ValueError):
-                        continue
-                    axis = str(row.get('axis', '')).upper()
-                    scalar = str(row.get('scalar', ''))
-                    self.stats_rows[(scalar, axis, pidx)] = row
-                    if row.get('label_a'):
-                        self.stats_labels = (row.get('label_a', 'Run A'),
-                                             row.get('label_b', 'Run B'))
-        except Exception as exc:
-            print(f"[viz_viewer] could not read stats CSV: {exc}")
-            self.stats_rows = {}
-
-    def _current_stat_row(self):
-        """Row dict for the slice on screen, or None."""
-        if not self.stats_rows or not self.keys:
-            return None
-        key = self.keys[self.idx]
-        if not isinstance(key[1], int):
-            return None
-        axis, pidx = key[0].upper(), key[1]
-        scalar = self.v_scalar.get()
-        return self.stats_rows.get((scalar, axis, pidx))
-
-    @staticmethod
-    def _fmt(v):
-        try:
-            x = float(v)
-        except (TypeError, ValueError):
-            return "—"
-        if x != x:                       # NaN
-            return "—"
-        ax = abs(x)
-        if ax != 0 and (ax < 1e-3 or ax >= 1e5):
-            return f"{x:.3e}"
-        return f"{x:+.4f}"
-
-    def _update_stats_strip(self):
-        if not hasattr(self, "stats_strip"):
-            return
-        if not self.stats_rows:
-            if self.stats_csv_path is None:
-                self.stats_strip.config(
-                    text="Diff stats: no comparison_summary.csv found near the "
-                         "loaded folders.", fg="#999")
-            return
-        row = self._current_stat_row()
-        if row is None:
-            self.stats_strip.config(
-                text=f"Diff stats: no row for this slice "
-                     f"(scalar={self.v_scalar.get()}).", fg="#999")
-            return
-        la, lb = self.stats_labels
-        txt = (f"Δ ({lb}−{la})  "
-               f"mean={self._fmt(row.get('mean'))}   "
-               f"std={self._fmt(row.get('std'))}   "
-               f"min={self._fmt(row.get('min'))}   "
-               f"max={self._fmt(row.get('max'))}   "
-               f"p05={self._fmt(row.get('p05'))}  "
-               f"p50={self._fmt(row.get('p50'))}  "
-               f"p95={self._fmt(row.get('p95'))}   "
-               f"n={self._fmt_int(row.get('n'))} px")
-        self.stats_strip.config(text=txt, fg="#1A237E")
-
-    @staticmethod
-    def _fmt_int(v):
-        try:
-            f = float(v)
-            if f != f:
-                return "—"
-            return f"{int(f):,}"
-        except (TypeError, ValueError):
-            return "—"
-
-    def _show_stats_popup(self):
-        if not self.stats_rows:
-            messagebox.showinfo(
-                "No diff stats",
-                "No comparison_summary.csv was found.\n\n"
-                "Point the Delta field at a comparison output folder "
-                "(the one that contains comparison_summary.csv) and click Load.")
-            return
-        row = self._current_stat_row()
-        if row is None:
-            messagebox.showinfo(
-                "No row",
-                "comparison_summary.csv has no entry for the current "
-                f"slice (scalar={self.v_scalar.get()}, "
-                f"{_label(self.keys[self.idx]) if self.keys else '—'}).")
-            return
-        StatsPopup(self, row, self.stats_labels, self.stats_csv_path,
-                   self._current_label())
-
-    def _current_label(self):
-        if self.keys:
-            return _label(self.keys[self.idx])
-        return "—"
-
     def _show(self):
         if not self.keys:
             for p in self.panes.values():
                 p.set_path(None)
             self.counter.config(text="0 / 0")
-            self._update_stats_strip()
             return
         key = self.keys[self.idx]
         for s in SETS:
@@ -563,72 +405,6 @@ class Viewer(tk.Tk):
         self.counter.config(text=f"{self.idx + 1} / {len(self.keys)}")
         if self.combo.current() != self.idx:
             self.combo.current(self.idx)
-        self._update_stats_strip()
-
-
-class StatsPopup(tk.Toplevel):
-    """Detailed diff-stats breakdown for one slice, read from a CSV row."""
-
-    ORDER = [("n",    "Fluid pixels (n)"),
-             ("mean", "Mean Δ"),
-             ("std",  "Std dev"),
-             ("min",  "Min Δ"),
-             ("max",  "Max Δ"),
-             ("p05",  "5th percentile"),
-             ("p50",  "Median (p50)"),
-             ("p95",  "95th percentile")]
-
-    def __init__(self, parent, row, labels, csv_path, slice_label):
-        super().__init__(parent)
-        la, lb = labels
-        self.title(f"Diff Stats — {slice_label}")
-        self.configure(bg=BG)
-        self.resizable(False, False)
-
-        hdr = tk.Frame(self, bg=ACCENT, height=40)
-        hdr.pack(fill="x"); hdr.pack_propagate(False)
-        tk.Label(hdr, text=f"  {row.get('scalar','?')}   "
-                           f"{row.get('axis','?')} #{row.get('plane_idx','?')}"
-                           f"   {row.get('val_mm','?')} mm",
-                 font=("Segoe UI", 12, "bold"), bg=ACCENT, fg="white")\
-            .pack(side="left", padx=PAD)
-
-        tk.Label(self, text=f"Δ  =  ({lb})  −  ({la})    over fluid pixels",
-                 font=FONT, bg=BG, fg="#555")\
-            .pack(anchor="w", padx=PAD, pady=(PAD, PAD_SM))
-
-        grid = tk.Frame(self, bg=BG)
-        grid.pack(fill="both", expand=True, padx=PAD, pady=PAD_SM)
-        for i, (k, lbl) in enumerate(self.ORDER):
-            tk.Label(grid, text=lbl, font=FONT, bg=BG, anchor="w", width=18)\
-                .grid(row=i, column=0, sticky="w", padx=PAD, pady=2)
-            val = Viewer._fmt_int(row.get(k)) if k == "n" \
-                else Viewer._fmt(row.get(k))
-            tk.Label(grid, text=val, font=FONT_M, bg="white", anchor="e",
-                     width=16, relief="solid", bd=1)\
-                .grid(row=i, column=1, sticky="e", padx=PAD, pady=2, ipadx=4)
-
-        ft = tk.Frame(self, bg=BG_D)
-        ft.pack(fill="x", side="bottom")
-        tk.Label(ft, text=os.path.basename(csv_path) if csv_path else "",
-                 font=("Segoe UI", 8), bg=BG_D, fg="#777", anchor="w")\
-            .pack(side="left", padx=PAD, pady=PAD_SM)
-        tk.Button(ft, text="Copy", command=lambda: self._copy(row, labels),
-                  **BTN_SEC).pack(side="right", padx=PAD, pady=PAD_SM)
-
-    def _copy(self, row, labels):
-        la, lb = labels
-        lines = [f"Diff stats  ({lb} - {la})",
-                 f"{row.get('scalar','?')}  {row.get('axis','?')} "
-                 f"#{row.get('plane_idx','?')}  {row.get('val_mm','?')} mm"]
-        for k, lbl in self.ORDER:
-            val = Viewer._fmt_int(row.get(k)) if k == "n" \
-                else Viewer._fmt(row.get(k))
-            lines.append(f"  {lbl:<18} {val}")
-        text = "\n".join(lines)
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        self.update()
 
 
 def main():

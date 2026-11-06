@@ -6,7 +6,7 @@
 --------------------------------------------------------------------------------
   Slice, interpolate and compare STAR-CCM+ EnSight Gold exports.
   Do not distribute without permission.
-  
+
 cli.py
 ======
 Command-line interface for the CFD slicer.
@@ -15,6 +15,7 @@ Usage
 -----
   python cli.py run   [options]
   python cli.py compare DIR_A DIR_B [options]
+  python cli.py surfcp SURFACE_CASE --axis Y --pos 0:600:150 [options]
   python cli.py info  NPZ_PATH [options]
   python cli.py list  NPZ_ROOT [options]
 
@@ -26,8 +27,11 @@ Run examples
   # Only Cp, only X-planes, 2mm resolution
   python cli.py run --scalars Cp --axes X --res 2
 
-  # Only CpT and Cp, Y and Z planes
-  python cli.py run --scalars Cp CpT --axes Y Z
+  # Recruits: give 12 GB of RAM to parallel plane processing
+  python cli.py run --ram 12
+
+  # ... or force exactly 4 planes at once
+  python cli.py run --recruits 4
 
   # Override paths without editing config.py
   python cli.py run --geom path/to/Geometry.case \\
@@ -36,10 +40,24 @@ Run examples
 
 Compare examples
 ----------------
-  # Compare two run output directories
+  # Default delta ranges: +/-0.5, vorticity +/-500
   python cli.py compare path/to/run1 path/to/run2 \\
-                        --label-a "Baseline" --label-b "New config" \\
-                        --scalars Cp --axes X
+                        --label-a "Baseline" --label-b "New config"
+
+  # Auto range per plane instead
+  python cli.py compare run1 run2 --auto-range
+
+  # Custom fixed ranges for some scalars
+  python cli.py compare run1 run2 --range Cp=0.3 CpT=0.2
+
+Surface Cp along slices
+-----------------------
+  # Cp vs X on Y-slices at 0, 150, 300, 450, 600 mm (PNG + CSV each)
+  python cli.py surfcp path/to/Surface.case --axis Y --pos 0:600:150 --out out/
+
+  # Front wing only, zoomed
+  python cli.py surfcp Surface.case --axis Y --pos 300 --parts "Front wing" \\
+                       --hlim -1.0 -0.55
 
 Info / list
 -----------
@@ -52,6 +70,7 @@ Info / list
 """
 
 import argparse
+import multiprocessing
 import sys
 import os
 
@@ -67,22 +86,46 @@ def cmd_run(args):
         data_case     = args.data     or None,
         output_dir    = args.out      or None,
         resolution_mm = args.res      or None,
+        ram_budget_gb = args.ram,
+        recruits      = args.recruits,
     )
 
 
 def cmd_compare(args):
     import compare
+    scalars = args.scalars or list(cfg.SCALARS.keys())
+    ranges = None
+    if args.auto_range:
+        ranges = {k: None for k in scalars}
+    if args.range:
+        ranges = dict(ranges or {})
+        for item in args.range:
+            k, _, v = item.partition('=')
+            ranges[k.strip()] = None if v.strip().lower() == 'auto' else float(v)
     compare.compare_runs(
-        dir_a      = args.dir_a,
-        dir_b      = args.dir_b,
-        scalars    = args.scalars or None,
-        axes       = args.axes    or None,
-        output_dir = args.out     or None,
-        label_a    = args.label_a,
-        label_b    = args.label_b,
-        log_a      = args.log_a   or None,
-        log_b      = args.log_b   or None,
-        images     = not args.no_images,
+        dir_a        = args.dir_a,
+        dir_b        = args.dir_b,
+        scalars      = args.scalars or None,
+        axes         = args.axes    or None,
+        output_dir   = args.out     or None,
+        label_a      = args.label_a,
+        label_b      = args.label_b,
+        delta_ranges = ranges,
+    )
+
+
+def cmd_surfcp(args):
+    import surface_cp as sc
+    parts = sc.load_surface(args.surface_case)
+    sc.export_sections(
+        parts, args.axis, sc.parse_positions(' '.join(args.pos)),
+        args.scalar, args.out or cfg.OUTPUT_DIR or '.',
+        part_names=args.parts or None,
+        invert=not args.no_invert,
+        h_lim=tuple(args.hlim) if args.hlim else None,
+        val_lim=tuple(args.vlim) if args.vlim else None,
+        show_profile=not args.no_profile,
+        write_csv_files=not args.no_csv,
     )
 
 
@@ -106,6 +149,9 @@ def cmd_info(args):
         if key in d:
             arr = d[key]
             valid = arr[~np.isnan(arr) & ~d['mask']]
+            if valid.size == 0:
+                print(f"    {key:10s}  shape={arr.shape}  (no fluid data)")
+                continue
             print(f"    {key:10s}  shape={arr.shape}  "
                   f"fluid range=[{valid.min():.4f}, {valid.max():.4f}]  "
                   f"mean={valid.mean():.4f}")
@@ -139,7 +185,7 @@ def build_parser():
     p_run.add_argument('--axes', nargs='+', choices=['X','Y','Z'],
                        metavar='AXIS',
                        help='Axes to slice (default: X Y Z)')
-    p_run.add_argument('--res', type=int, metavar='MM',
+    p_run.add_argument('--res', type=float, metavar='MM',
                        help=f'Resolution in mm/px (default: {cfg.RESOLUTION_MM})')
     p_run.add_argument('--geom', metavar='PATH',
                        help='Override geometry .case path')
@@ -147,6 +193,11 @@ def build_parser():
                        help='Override CFD data .case path')
     p_run.add_argument('--out', metavar='DIR',
                        help='Override output directory')
+    p_run.add_argument('--ram', type=float, metavar='GB', default=None,
+                       help='Recruits: RAM budget for parallel planes '
+                            '(default: one plane at a time)')
+    p_run.add_argument('--recruits', type=int, metavar='N', default=None,
+                       help='Recruits: force exactly N planes at once')
 
     # ── compare ───────────────────────────────────────────────────
     p_cmp = sub.add_parser('compare',
@@ -166,13 +217,35 @@ def build_parser():
                        help='Label for DIR_A in plots')
     p_cmp.add_argument('--label-b', default='Run B',
                        help='Label for DIR_B in plots')
-    p_cmp.add_argument('--log-a', metavar='PATH',
-                       help='STAR-CCM+ .log for DIR_A (enables aero report)')
-    p_cmp.add_argument('--log-b', metavar='PATH',
-                       help='STAR-CCM+ .log for DIR_B (enables aero report)')
-    p_cmp.add_argument('--no-images', action='store_true',
-                       help='Skip plane-image/NPZ diffing. Use with --log-a/--log-b '
-                            'to produce an aero (job) comparison on its own.')
+    p_cmp.add_argument('--auto-range', action='store_true',
+                       help='Auto delta range per plane '
+                            f'(default: fixed +/-{cfg.DELTA_RANGE_DEFAULT:g}, '
+                            f'vorticity +/-{cfg.DELTA_RANGE_VORTICITY:g})')
+    p_cmp.add_argument('--range', nargs='+', metavar='KEY=VAL',
+                       help='Per-scalar fixed range, e.g. Cp=0.3 CpT=auto')
+
+    # ── surfcp ────────────────────────────────────────────────────
+    p_scp = sub.add_parser('surfcp',
+                           help='Surface Cp (or Cf) along slices — PNG + CSV')
+    p_scp.add_argument('surface_case', metavar='SURFACE_CASE')
+    p_scp.add_argument('--axis', choices=['X', 'Y', 'Z'], default='Y')
+    p_scp.add_argument('--pos', nargs='+', required=True, metavar='MM',
+                       help='Positions in mm: list and/or start:stop:step')
+    p_scp.add_argument('--scalar', default='Cp',
+                       help=f'Surface scalar (default Cp). '
+                            f'Available: {list(cfg.SURFACE_SCALARS.keys())}')
+    p_scp.add_argument('--parts', nargs='+', metavar='NAME',
+                       help='Only these parts (default: all)')
+    p_scp.add_argument('--hlim', nargs=2, type=float, metavar=('MIN', 'MAX'),
+                       help='Horizontal limits in metres')
+    p_scp.add_argument('--vlim', nargs=2, type=float, metavar=('MIN', 'MAX'),
+                       help='Value axis limits')
+    p_scp.add_argument('--out', metavar='DIR', help='Output directory')
+    p_scp.add_argument('--no-invert', action='store_true',
+                       help='Do not invert the value axis')
+    p_scp.add_argument('--no-profile', action='store_true',
+                       help='Skip the section profile panel')
+    p_scp.add_argument('--no-csv', action='store_true', help='Skip CSV export')
 
     # ── info ──────────────────────────────────────────────────────
     p_info = sub.add_parser('info',
@@ -192,6 +265,7 @@ def build_parser():
 
 
 def main():
+    multiprocessing.freeze_support()
     parser = build_parser()
 
     # No arguments -> default to a full run
@@ -203,6 +277,7 @@ def main():
     dispatch = {
         'run':     cmd_run,
         'compare': cmd_compare,
+        'surfcp':  cmd_surfcp,
         'info':    cmd_info,
         'list':    cmd_list,
     }

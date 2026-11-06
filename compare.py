@@ -18,12 +18,13 @@ compare_runs(dir_a, dir_b, scalars=None, axes=None,
              fig_height=7.0, dpi=None,
              delta_ranges=None)
 
-delta_ranges : dict[scalar_key, float or None]
-    Per-scalar fixed colormap range for delta plots.
+delta_ranges : dict[scalar_key, float or None] or None
+    Per-scalar colormap range for delta plots.
     float -> fixed symmetric range +/- value
     None  -> auto per-plane range
-    e.g. {'Cp': 0.1, 'CpT': None, 'Vi': 0.2}
-    Missing keys default to None (auto).
+    e.g. {'Cp': 0.5, 'CpT': None, 'VorticityMag': 500}
+    Scalars not listed (or delta_ranges=None) use the defaults from
+    config.default_delta_range(): +/-0.5, or +/-500 for vorticity.
 """
 
 import os
@@ -94,14 +95,25 @@ def _diff_stats(grid_a, grid_b, mask_a, mask_b):
     )
 
 
+def resolve_delta_ranges(scalars, delta_ranges=None):
+    """
+    Fill in config defaults (+/-0.5, vorticity +/-500) for every scalar
+    not explicitly given. An explicit None keeps auto-scaling.
+    """
+    delta_ranges = dict(delta_ranges or {})
+    for skey in scalars:
+        if skey not in delta_ranges:
+            delta_ranges[skey] = cfg.default_delta_range(skey)
+    return delta_ranges
+
+
 def compare_runs(dir_a, dir_b,
                  scalars=None, axes=None,
                  output_dir=None,
                  label_a='Run A', label_b='Run B',
                  log_a=None, log_b=None,
                  fig_height=7.0, dpi=None,
-                 delta_ranges=None,
-                 images=True):
+                 delta_ranges=None):
     """
     Compare two run output directories.
 
@@ -119,20 +131,16 @@ def compare_runs(dir_a, dir_b,
         Per-scalar fixed range for delta colormap.
         float -> fixed +/- value applied to every plane for that scalar.
         None  -> auto per-plane.
-        Missing scalar keys default to None (auto).
-    images         : bool
-        When True (default) compute per-plane image/NPZ diffs and write delta
-        PNGs + summary CSV. When False, skip all plane-image work entirely; the
-        aero report (if log_a/log_b are given) still runs. This lets a job /
-        aero comparison be produced independently of image comparison.
+        Missing scalar keys use config.default_delta_range()
+        (+/-0.5, or +/-500 for vorticity).
 
     Returns
     -------
-    summary : list of dicts   (empty when images=False)
+    summary : list of dicts
     """
     scalars_to_run = scalars  or list(cfg.SCALARS.keys())
     axes_to_run    = axes     or ['X', 'Y', 'Z']
-    delta_ranges   = delta_ranges or {}
+    delta_ranges   = resolve_delta_ranges(scalars_to_run, delta_ranges)
 
     if output_dir is None:
         output_dir = os.path.join(
@@ -140,106 +148,99 @@ def compare_runs(dir_a, dir_b,
             f"compare_{os.path.basename(dir_b)}_vs_{os.path.basename(dir_a)}"
         )
 
+    npz_root_a = os.path.join(dir_a, 'NPZ')
+    npz_root_b = os.path.join(dir_b, 'NPZ')
+
+    planes_a = {(ax, pidx): path
+                for ax, pidx, pmm, path
+                in io_utils.find_planes(npz_root_a)}
+    planes_b = {(ax, pidx): path
+                for ax, pidx, pmm, path
+                in io_utils.find_planes(npz_root_b)}
+
+    matching = sorted(set(planes_a.keys()) & set(planes_b.keys()))
+
+    print(f"Comparing {len(matching)} matching planes  scalars={scalars_to_run}")
+    print(f"  {label_a}: {dir_a}")
+    print(f"  {label_b}: {dir_b}")
+    print(f"  Output  : {output_dir}")
+    print(f"  Delta ranges:")
+    for skey in scalars_to_run:
+        dr = delta_ranges.get(skey)
+        print(f"    {skey}: {'auto per-plane' if dr is None else f'fixed +/-{dr:g}'}")
+    print()
+
     summary = []
 
-    if images:
-        npz_root_a = os.path.join(dir_a, 'NPZ')
-        npz_root_b = os.path.join(dir_b, 'NPZ')
+    for ax_str, pidx in matching:
+        if ax_str not in axes_to_run:
+            continue
 
-        planes_a = {(ax, pidx): path
-                    for ax, pidx, pmm, path
-                    in io_utils.find_planes(npz_root_a)}
-        planes_b = {(ax, pidx): path
-                    for ax, pidx, pmm, path
-                    in io_utils.find_planes(npz_root_b)}
+        path_a = planes_a[(ax_str, pidx)]
+        path_b = planes_b[(ax_str, pidx)]
 
-        matching = sorted(set(planes_a.keys()) & set(planes_b.keys()))
-
-        print(f"Comparing {len(matching)} matching planes  scalars={scalars_to_run}")
-        print(f"  {label_a}: {dir_a}")
-        print(f"  {label_b}: {dir_b}")
-        print(f"  Output  : {output_dir}")
-        print(f"  Delta ranges:")
         for skey in scalars_to_run:
-            dr = delta_ranges.get(skey)
-            print(f"    {skey}: {'auto per-plane' if dr is None else f'fixed +/-{dr}'}")
-        print()
-
-        for ax_str, pidx in matching:
-            if ax_str not in axes_to_run:
+            try:
+                grid_a, grid_b, mask_a, mask_b, extent, meta = \
+                    load_and_diff(path_a, path_b, skey)
+            except KeyError as e:
+                print(f"  [{ax_str}#{pidx:03d}] {skey}: SKIP -- {e}")
                 continue
 
-            path_a = planes_a[(ax_str, pidx)]
-            path_b = planes_b[(ax_str, pidx)]
+            ax_slice  = meta['plane_axis']
+            plane_val = meta['plane_value_m']
+            plane_idx = meta['plane_index']
+            val_mm    = plane_val * 1000.0
+            h_label, v_label = cfg.PLOT_LABELS[ax_slice]
 
-            for skey in scalars_to_run:
-                try:
-                    grid_a, grid_b, mask_a, mask_b, extent, meta = \
-                        load_and_diff(path_a, path_b, skey)
-                except KeyError as e:
-                    print(f"  [{ax_str}#{pidx:03d}] {skey}: SKIP -- {e}")
-                    continue
+            stats = _diff_stats(grid_a, grid_b, mask_a, mask_b)
+            summary.append(dict(
+                axis=ax_str, plane_idx=plane_idx, val_mm=val_mm,
+                scalar=skey, label_a=label_a, label_b=label_b,
+                **stats
+            ))
 
-                ax_slice  = meta['plane_axis']
-                plane_val = meta['plane_value_m']
-                plane_idx = meta['plane_index']
-                val_mm    = plane_val * 1000.0
-                h_label, v_label = cfg.PLOT_LABELS[ax_slice]
+            # Delta PNG
+            png_dir = os.path.join(output_dir, 'PNG', skey, ax_str)
+            os.makedirs(png_dir, exist_ok=True)
+            stem = f"diff_{skey}_{ax_str}_{plane_idx:03d}_{val_mm:+.1f}mm"
 
-                stats = _diff_stats(grid_a, grid_b, mask_a, mask_b)
-                summary.append(dict(
-                    axis=ax_str, plane_idx=plane_idx, val_mm=val_mm,
-                    scalar=skey, label_a=label_a, label_b=label_b,
-                    **stats
-                ))
+            fig = plotting.make_diff_plot(
+                grid_a, grid_b, mask_a, mask_b,
+                ax_slice, plane_idx, val_mm,
+                h_label, v_label, extent, skey,
+                label_a=label_a, label_b=label_b,
+                fig_height=fig_height, dpi=dpi,
+                fixed_range=delta_ranges.get(skey),
+            )
+            fig.savefig(os.path.join(png_dir, stem + '.png'),
+                        bbox_inches='tight',
+                        facecolor=cfg.BG_COLOR,
+                        dpi=dpi or cfg.DPI)
+            plt.close(fig)
 
-                # Delta PNG
-                png_dir = os.path.join(output_dir, 'PNG', skey, ax_str)
-                os.makedirs(png_dir, exist_ok=True)
-                stem = f"diff_{skey}_{ax_str}_{plane_idx:03d}_{val_mm:+.1f}mm"
+            range_note = (f"fixed+/-{delta_ranges[skey]:g}"
+                          if delta_ranges.get(skey) is not None
+                          else "auto")
+            print(f"  [{ax_str}#{plane_idx:03d}  {val_mm:+.1f}mm]  {skey}  "
+                  f"mean={stats['mean']:+.4f}  "
+                  f"max={stats['max']:+.4f}  "
+                  f"range={range_note}")
 
-                fig = plotting.make_diff_plot(
-                    grid_a, grid_b, mask_a, mask_b,
-                    ax_slice, plane_idx, val_mm,
-                    h_label, v_label, extent, skey,
-                    label_a=label_a, label_b=label_b,
-                    fig_height=fig_height, dpi=dpi,
-                    fixed_range=delta_ranges.get(skey),
-                )
-                fig.savefig(os.path.join(png_dir, stem + '.png'),
-                            bbox_inches='tight',
-                            facecolor=cfg.BG_COLOR,
-                            dpi=dpi or cfg.DPI)
-                plt.close(fig)
-
-                range_note = (f"fixed+/-{delta_ranges[skey]}"
-                              if skey in delta_ranges and delta_ranges[skey] is not None
-                              else "auto")
-                print(f"  [{ax_str}#{plane_idx:03d}  {val_mm:+.1f}mm]  {skey}  "
-                      f"mean={stats['mean']:+.4f}  "
-                      f"max={stats['max']:+.4f}  "
-                      f"range={range_note}")
-
-        # Summary CSV
-        if summary:
-            os.makedirs(output_dir, exist_ok=True)
-            csv_path = os.path.join(output_dir, 'comparison_summary.csv')
-            with open(csv_path, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=summary[0].keys())
-                writer.writeheader()
-                writer.writerows(summary)
-            print(f"\nSummary CSV: {csv_path}")
-    else:
-        print("Image comparison skipped (images=False).")
-        print(f"  {label_a}: {dir_a}")
-        print(f"  {label_b}: {dir_b}")
-        print(f"  Output  : {output_dir}")
+    # Summary CSV
+    if summary:
+        os.makedirs(output_dir, exist_ok=True)
+        csv_path = os.path.join(output_dir, 'comparison_summary.csv')
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=summary[0].keys())
+            writer.writeheader()
+            writer.writerows(summary)
+        print(f"\nSummary CSV: {csv_path}")
 
     # Aero report
     if log_a and log_b:
         try:
             import aero_report as ar
-            os.makedirs(output_dir, exist_ok=True)
             print("\nGenerating aero report...")
             n_a, d_a = ar.parse_log(log_a)
             n_b, d_b = ar.parse_log(log_b)

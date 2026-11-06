@@ -13,6 +13,7 @@ File I/O helpers — loading geometry/CFD meshes and saving/loading NPZ results.
 
 Functions
 ---------
+check_case(case_path, kind)    -> verify the .case and the files it references
 load_geometry(case_path)       -> list of pyvista blocks
 load_cfd(case_path)            -> pyvista MultiBlock
 save_plane(out_dir, stem, cp_grids, mask, extent, meta)
@@ -25,6 +26,91 @@ import numpy as np
 import pyvista as pv
 
 import config as cfg
+
+
+# ── EnSight pre-flight check ─────────────────────────────────────
+
+def _case_refs(case_path):
+    """
+    Files an EnSight .case refers to: (model_file, [variable files]).
+    Wildcards (Name*****.geo) are expanded with the 'filename start number'.
+    """
+    with open(case_path, 'r', errors='replace') as f:
+        lines = f.read().splitlines()
+    start = 0
+    for ln in lines:
+        if ln.strip().lower().startswith('filename start number'):
+            try:
+                start = int(ln.split(':', 1)[1].split()[0])
+            except (IndexError, ValueError):
+                pass
+
+    def _expand(name):
+        if '*' not in name:
+            return name
+        n = name.count('*')
+        return name.replace('*' * n, f"{start:0{n}d}")
+
+    model, variables, section = None, [], None
+    for ln in lines:
+        s = ln.strip()
+        if not s or s.startswith('#'):
+            continue
+        if s.upper() in ('FORMAT', 'GEOMETRY', 'VARIABLE', 'TIME', 'FILE'):
+            section = s.upper()
+            continue
+        if ':' not in s:
+            continue
+        key, val = s.split(':', 1)
+        tokens = val.split()
+        if not tokens:
+            continue
+        if section == 'GEOMETRY' and key.strip().lower() == 'model':
+            name = tokens[-1]
+            if name.lower() == 'change_coords_only' and len(tokens) > 1:
+                name = tokens[-2]
+            model = _expand(name)
+        elif section == 'VARIABLE':
+            variables.append(_expand(tokens[-1]))
+    return model, variables
+
+
+def check_case(case_path, kind='CFD data'):
+    """
+    Make sure an EnSight .case and the files it refers to are where VTK will
+    look for them (the .case's own folder). VTK only reports 'stat failed'
+    and then carries on with an empty mesh, so check first.
+
+    Raises FileNotFoundError (with the exact missing file) if the .case or
+    its geometry file is missing. Returns the list of missing variable
+    files (the mesh still loads, but without those scalars).
+    """
+    if not case_path:
+        raise FileNotFoundError(f"No {kind} .case file is set.")
+    if not os.path.isfile(case_path):
+        raise FileNotFoundError(f"{kind} file not found: {case_path}")
+    if not case_path.lower().endswith('.case'):
+        return []
+
+    folder = os.path.dirname(os.path.abspath(case_path))
+    model, variables = _case_refs(case_path)
+    if model:
+        geo = os.path.join(folder, model)
+        if not os.path.isfile(geo):
+            others = sorted(f for f in os.listdir(folder) if f.lower().endswith('.geo'))
+            raise FileNotFoundError(
+                f"{kind}: the .case expects its geometry file '{model}' in the "
+                f"same folder, but it is not there.\n"
+                f"  .case  : {case_path}\n"
+                f"  looked : {geo}\n"
+                f"  .geo files in that folder: {others or 'none'}\n"
+                f"Keep the .case, the .geo and the variable files together "
+                f"(or fix the 'model:' line in the .case).")
+    missing = [v for v in variables if not os.path.isfile(os.path.join(folder, v))]
+    for v in missing:
+        print(f"  [WARN] {kind}: variable file missing next to the .case: {v} "
+              f"— that scalar will be empty")
+    return missing
 
 
 # ── loaders ──────────────────────────────────────────────────────
@@ -42,10 +128,14 @@ def load_geometry(case_path=None):
     list of pyvista datasets (one per geometry part)
     """
     path = case_path or cfg.GEOMETRY_CASE
+    check_case(path, 'Geometry')
     pv.global_theme.allow_empty_mesh = True
     mesh = pv.read(path)
     blocks = [mesh[i] for i in range(mesh.n_blocks)
               if mesh[i] is not None and mesh[i].n_cells > 0]
+    if not blocks:
+        raise RuntimeError(f"Geometry loaded 0 parts from {path} — "
+                           f"check that the .case and its .geo file match.")
     return blocks
 
 
@@ -62,6 +152,7 @@ def load_cfd(case_path=None):
     pyvista MultiBlock
     """
     path = case_path or cfg.DATA_CASE
+    check_case(path, 'CFD data')
     pv.global_theme.allow_empty_mesh = True
     return pv.read(path)
 

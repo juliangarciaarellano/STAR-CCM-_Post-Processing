@@ -12,11 +12,14 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
+import multiprocessing
+import queue
 import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as cfg
+import recruits as rc
 
 # ══════════════════════════════════════════════════════════════════
 #  STYLE
@@ -25,10 +28,14 @@ PAD    = 8
 PAD_SM = 4
 FONT   = ("Segoe UI", 9)
 FONT_B = ("Segoe UI", 9, "bold")
+FONT_S = ("Segoe UI", 8)
 FONT_M = ("Consolas", 9)
 BG     = "#f5f5f5"
 BG_D   = "#e0e0e0"
 ACCENT = "#1976D2"
+OK_FG  = "#2E7D32"
+ERR_FG = "#C62828"
+WARN_FG = "#E65100"
 BTN_RUN = {"bg": "#1976D2", "fg": "white", "font": FONT_B,
             "relief": "flat", "padx": 12, "pady": 6, "cursor": "hand2"}
 BTN_SEC = {"bg": "#757575", "fg": "white", "font": FONT,
@@ -130,6 +137,19 @@ def section_label(parent, text, row, col=0, colspan=3):
     tk.Label(parent, text=text, font=FONT_B, bg=BG, fg=ACCENT)\
         .grid(row=row+1, column=col, sticky="w", padx=PAD, pady=(2, PAD_SM))
 
+def hint(parent, text, row, col=0, colspan=3, fg="#666"):
+    tk.Label(parent, text=text, font=FONT_S, bg=BG, fg=fg, justify="left")\
+        .grid(row=row, column=col, columnspan=colspan, sticky="w",
+              padx=PAD, pady=(0, PAD_SM))
+
+def surface_scalar_cfg(skey):
+    """Surface scalars first (Cp, Cf), then volume scalars."""
+    return cfg.SURFACE_SCALARS.get(skey) or cfg.SCALARS.get(skey) or {}
+
+def _float_or_none(s):
+    s = (s or "").strip()
+    return float(s) if s else None
+
 
 # ══════════════════════════════════════════════════════════════════
 #  LOG REDIRECTOR
@@ -139,7 +159,9 @@ class LogRedirector:
     def __init__(self, widget, original):
         self.widget = widget; self.original = original
     def write(self, text):
-        self.original.write(text)
+        if self.original is not None:
+            try: self.original.write(text)
+            except Exception: pass
         try:
             self.widget.configure(state="normal")
             self.widget.insert("end", text)
@@ -147,7 +169,10 @@ class LogRedirector:
             self.widget.configure(state="disabled")
         except Exception:
             pass
-    def flush(self): self.original.flush()
+    def flush(self):
+        if self.original is not None:
+            try: self.original.flush()
+            except Exception: pass
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -238,7 +263,8 @@ class RunTab(ScrollableFrame):
         af.grid(row=r, column=1, sticky="w", padx=PAD)
         for ax in ['X', 'Y', 'Z']:
             v = tk.BooleanVar(value=True); self.axis_vars[ax] = v
-            tk.Checkbutton(af, text=ax, variable=v, font=FONT, bg=BG)\
+            tk.Checkbutton(af, text=ax, variable=v, font=FONT, bg=BG,
+                           command=self._update_recruits)\
                 .pack(side="left", padx=PAD)
         r += 1
 
@@ -271,6 +297,48 @@ class RunTab(ScrollableFrame):
         tk.Entry(f, textvariable=self.v_dpi, width=6, font=FONT)\
             .grid(row=r, column=1, sticky="w", padx=PAD, pady=PAD_SM); r += 1
 
+        # ── Recruits ──────────────────────────────────────────────
+        section_label(f, "Recruits  (process several planes at once)", r); r += 2
+        hint(f, ("Each recruit is a separate worker that holds its own copy of the "
+                 "geometry and works on one plane.\nGive them more RAM and more planes "
+                 "run at the same time. 0 GB = off (one plane at a time)."), r); r += 1
+        hint(f, "Recruits — original beta by George Wei.", r, fg="#888"); r += 1
+
+        total_b, _ = rc.system_ram()
+        max_gb = 64.0
+        if total_b:
+            max_gb = max(1.0, round((total_b / rc.GB - cfg.RECRUIT_RESERVE_GB) * 2) / 2)
+        self.v_ram = tk.DoubleVar(value=float(cfg.RECRUIT_RAM_GB or 0.0))
+        tk.Label(f, text="RAM for recruits", font=FONT, bg=BG, anchor="w")\
+            .grid(row=r, column=0, sticky="w", padx=PAD, pady=PAD_SM)
+        sf = tk.Frame(f, bg=BG)
+        sf.grid(row=r, column=1, columnspan=2, sticky="ew", padx=PAD)
+        sf.columnconfigure(0, weight=1)
+        self.ram_scale = tk.Scale(sf, from_=0.0, to=max_gb, resolution=0.5,
+                                  orient="horizontal", variable=self.v_ram,
+                                  showvalue=False, bg=BG, highlightthickness=0,
+                                  troughcolor=BG_D, activebackground=ACCENT,
+                                  sliderlength=18, length=320,
+                                  command=lambda _v: self._update_recruits())
+        self.ram_scale.grid(row=0, column=0, sticky="ew")
+        self.ram_val_lbl = tk.Label(sf, text="", font=FONT_B, bg=BG, width=9,
+                                    anchor="e")
+        self.ram_val_lbl.grid(row=0, column=1, padx=(PAD_SM, 0))
+        r += 1
+
+        self.rec_lbl = tk.Label(f, text="", font=FONT_B, bg=BG, fg=ACCENT,
+                                anchor="w", justify="left")
+        self.rec_lbl.grid(row=r, column=1, columnspan=2, sticky="w", padx=PAD)
+        r += 1
+        self.rec_detail = tk.Label(f, text="", font=FONT_S, bg=BG, fg="#666",
+                                   anchor="w", justify="left")
+        self.rec_detail.grid(row=r, column=1, columnspan=2, sticky="w",
+                             padx=PAD, pady=(0, PAD_SM))
+        r += 1
+
+        for var in (self.v_res, self.v_figh, self.v_dpi, self.v_geom):
+            var.trace_add("write", lambda *_: self._update_recruits())
+
         bf = tk.Frame(f, bg=BG)
         bf.grid(row=r, column=0, columnspan=3, pady=PAD*2, padx=PAD, sticky="e")
         tk.Button(bf, text="Run Pipeline", command=self._run,
@@ -278,16 +346,77 @@ class RunTab(ScrollableFrame):
         self.status_lbl = tk.Label(bf, text="", font=FONT, bg=BG, fg="#555")
         self.status_lbl.pack(side="right", padx=PAD)
 
+        self._update_recruits()
+
     def _rebuild_scalar_checks(self):
         for w in self.scalar_frame.winfo_children(): w.destroy()
         self.scalar_vars = {}
         for skey in cfg.SCALARS:
             v = tk.BooleanVar(value=True); self.scalar_vars[skey] = v
             tk.Checkbutton(self.scalar_frame, text=skey, variable=v,
-                           font=FONT, bg=BG).pack(side="left", padx=PAD)
+                           font=FONT, bg=BG, command=self._update_recruits)\
+                .pack(side="left", padx=PAD)
 
     def refresh_scalars(self):
         self._rebuild_scalar_checks()
+        self._update_recruits()
+
+    # ── recruits estimate (live) ─────────────────────────────────
+    def _ram_budget(self):
+        gb = float(self.v_ram.get() or 0.0)
+        return gb if gb > 0 else None
+
+    def _update_recruits(self):
+        if not hasattr(self, 'rec_lbl'):
+            return
+        gb = float(self.v_ram.get() or 0.0)
+        self.ram_val_lbl.config(text="off" if gb <= 0 else f"{gb:.1f} GB")
+        try:
+            res  = float(self.v_res.get())
+            figh = float(self.v_figh.get())
+            dpi  = int(self.v_dpi.get())
+            assert res > 0
+        except Exception:
+            self.rec_lbl.config(text="(enter a valid resolution / size / DPI)",
+                                fg="#888")
+            self.rec_detail.config(text="")
+            return
+        axes = [k for k, v in self.axis_vars.items() if v.get()] or ['X', 'Y', 'Z']
+        n_sc = max(1, sum(1 for v in self.scalar_vars.values() if v.get()))
+        p = rc.plan(gb if gb > 0 else None, axes, res, n_sc, figh, dpi,
+                    self.v_geom.get().strip())
+
+        total_b, avail_b = rc.system_ram()
+        sysinfo = []
+        if total_b:
+            sysinfo.append(f"System RAM {total_b/rc.GB:.1f} GB")
+        if avail_b:
+            sysinfo.append(f"{avail_b/rc.GB:.1f} GB free now")
+        sysinfo.append(f"{p['cpu_max']} CPU threads")
+        per = p['per_recruit_gb']
+        detail = (f"~{per:.2f} GB per recruit = {cfg.RECRUIT_BASE_MB/1024:.2f} base"
+                  f" + {p['geom_gb']:.2f} geometry + {p['plane_gb']:.2f} largest plane"
+                  f" ({res:g} mm, {n_sc} scalar{'s' if n_sc != 1 else ''})"
+                  f"\n" + "  ·  ".join(sysinfo))
+
+        if gb <= 0:
+            self.rec_lbl.config(text="Off — 1 plane at a time", fg="#555")
+        elif gb < per:
+            self.rec_lbl.config(
+                text=f"1 plane at a time — one recruit needs ~{per:.2f} GB",
+                fg=WARN_FG)
+        else:
+            n = p['recruits']
+            txt = (f"{n} plane{'s' if n != 1 else ''} at once   "
+                   f"({p['used_gb']:.1f} of {gb:.1f} GB)")
+            if p['limit'] == 'cpu':
+                txt += f"   — capped by CPU ({p['cpu_max']} threads)"
+            colour = ACCENT
+            if avail_b and gb * rc.GB > avail_b:
+                txt += "   ⚠ more than free RAM"
+                colour = WARN_FG
+            self.rec_lbl.config(text=txt, fg=colour)
+        self.rec_detail.config(text=detail)
 
     def _run(self):
         scalars = [k for k, v in self.scalar_vars.items() if v.get()]
@@ -298,12 +427,12 @@ class RunTab(ScrollableFrame):
             messagebox.showwarning("Nothing to do", "Select at least one axis."); return
         try:
             res = float(self.v_res.get()); assert res > 0
-        except:
+        except Exception:
             messagebox.showerror("Invalid resolution",
                                  "mm per pixel must be a positive number."); return
         try:
             figh = float(self.v_figh.get()); dpi = int(self.v_dpi.get())
-        except:
+        except Exception:
             messagebox.showerror("Invalid size",
                                  "Figure height and DPI must be numbers."); return
 
@@ -311,6 +440,7 @@ class RunTab(ScrollableFrame):
         cfg.DATA_CASE     = self.v_data.get()
         cfg.OUTPUT_DIR    = self.v_out.get()
         cfg.DPI           = dpi
+        ram_gb = self._ram_budget()
 
         self.status_lbl.config(text="Running...", fg=ACCENT)
         self.app.notebook.select(self.app.log_tab)
@@ -320,10 +450,11 @@ class RunTab(ScrollableFrame):
                 import pipeline
                 pipeline.run_pipeline(scalars=scalars, axes=axes,
                                        resolution_mm=res,
-                                       fig_height=figh, dpi=dpi)
-                self.status_lbl.config(text="Done", fg="#2E7D32")
+                                       fig_height=figh, dpi=dpi,
+                                       ram_budget_gb=ram_gb)
+                self.status_lbl.config(text="Done", fg=OK_FG)
             except Exception as exc:
-                self.status_lbl.config(text="Error", fg="#C62828")
+                self.status_lbl.config(text="Error", fg=ERR_FG)
                 print(f"\n[ERROR] {exc}")
                 import traceback; traceback.print_exc()
         threading.Thread(target=_worker, daemon=True).start()
@@ -376,22 +507,21 @@ class CompareTab(ScrollableFrame):
         r += 1
 
         section_label(f, "Delta Colormap Range", r); r += 2
-        tk.Label(f,
-                 text=("Auto: scale +/-max(|diff|) per plane  |  "
-                       "Fixed: same symmetric range for every plane of that scalar"),
-                 font=("Segoe UI", 8), bg=BG, fg="#666")\
-            .grid(row=r, column=0, columnspan=3, sticky="w",
-                  padx=PAD, pady=(0, PAD_SM))
-        r += 1
-        for col, hdr in enumerate(["Scalar", "Mode", "Fixed +/- value"]):
-            tk.Label(f, text=hdr, font=FONT_B, bg=BG_D)\
-                .grid(row=r, column=col, sticky="ew",
-                      padx=1, pady=1, ipadx=6, ipady=3)
-        r += 1
-        self.range_frame_row = r
+        hint(f, (f"Fixed: same symmetric range for every plane of that scalar  "
+                 f"(defaults: ±{cfg.DELTA_RANGE_DEFAULT:g}, "
+                 f"vorticity ±{cfg.DELTA_RANGE_VORTICITY:g})  |  "
+                 f"Auto: ±max(|diff|) per plane"), r); r += 1
+        self.range_frame = tk.Frame(f, bg=BG)
+        self.range_frame.grid(row=r, column=0, columnspan=3, sticky="w", padx=PAD)
         self.range_vars = {}
-        self._rebuild_range_rows(f)
-        r += len(cfg.SCALARS)
+        self._rebuild_range_rows()
+        r += 1
+        tk.Button(f, text="Reset ranges to defaults", font=FONT, bg=BG_D,
+                  relief="flat", cursor="hand2",
+                  command=self._reset_ranges)\
+            .grid(row=r, column=0, columnspan=2, sticky="w", padx=PAD,
+                  pady=(PAD_SM, 0))
+        r += 1
 
         section_label(f, "Delta Image Size", r); r += 2
         tk.Label(f, text="Figure height (in)", font=FONT, bg=BG, anchor="w")\
@@ -424,7 +554,7 @@ class CompareTab(ScrollableFrame):
         tk.Label(f,
                  text=("Geometry key:  Gray = both  |  "
                        "Magenta = new (Run B only)  |  Brown = removed (Run A only)"),
-                 font=("Segoe UI", 8), bg=BG, fg="#555", justify="left")\
+                 font=FONT_S, bg=BG, fg="#555", justify="left")\
             .grid(row=r, column=0, columnspan=3, sticky="w",
                   padx=PAD, pady=PAD_SM); r += 1
 
@@ -444,45 +574,48 @@ class CompareTab(ScrollableFrame):
             tk.Checkbutton(self.scalar_frame, text=skey, variable=v,
                            font=FONT, bg=BG).pack(side="left", padx=PAD)
 
-    def _rebuild_range_rows(self, f=None):
-        if f is None:
-            f = self.inner
-        # Clean up old widgets
-        for skey, (mv, vv, ew) in self.range_vars.items():
-            try:
-                for widget in f.grid_slaves():
-                    if int(widget.grid_info().get('row', -1)) == \
-                       self.range_frame_row + list(cfg.SCALARS.keys()).index(skey):
-                        widget.destroy()
-            except Exception:
-                pass
+    def _rebuild_range_rows(self):
+        """Rows live in their own frame, so adding scalars never overlaps."""
+        old = {k: (m.get(), v.get()) for k, (m, v, _) in self.range_vars.items()}
+        for w in self.range_frame.winfo_children():
+            w.destroy()
         self.range_vars = {}
-        r = self.range_frame_row
-        for skey in cfg.SCALARS:
-            mode_var  = tk.StringVar(value="auto")
-            value_var = tk.StringVar(value="0.1")
-            tk.Label(f, text=skey, font=FONT, bg=BG, anchor="w")\
+        for col, hdr in enumerate(["Scalar", "Mode", "Fixed ± value"]):
+            tk.Label(self.range_frame, text=hdr, font=FONT_B, bg=BG_D)\
+                .grid(row=0, column=col, sticky="ew",
+                      padx=1, pady=1, ipadx=6, ipady=3)
+        for r, skey in enumerate(cfg.SCALARS, start=1):
+            mode0, val0 = old.get(skey, ("fixed",
+                                         f"{cfg.default_delta_range(skey):g}"))
+            mode_var  = tk.StringVar(value=mode0)
+            value_var = tk.StringVar(value=val0)
+            tk.Label(self.range_frame, text=skey, font=FONT, bg=BG, anchor="w")\
                 .grid(row=r, column=0, sticky="w", padx=PAD, pady=2)
-            mf = tk.Frame(f, bg=BG)
+            mf = tk.Frame(self.range_frame, bg=BG)
             mf.grid(row=r, column=1, sticky="w", padx=PAD)
-            for mode in ["auto", "fixed"]:
+            for mode in ["fixed", "auto"]:
                 tk.Radiobutton(mf, text=mode, variable=mode_var,
                                value=mode, font=FONT, bg=BG,
-                               command=lambda mv=mode_var, vv=value_var,
-                                              sk=skey: self._toggle_range(mv, vv, sk))\
+                               command=lambda sk=skey: self._toggle_range(sk))\
                     .pack(side="left", padx=PAD_SM)
-            entry = tk.Entry(f, textvariable=value_var, width=8,
-                             font=FONT, state="disabled", bg=BG_D)
+            entry = tk.Entry(self.range_frame, textvariable=value_var, width=8,
+                             font=FONT)
             entry.grid(row=r, column=2, padx=PAD, pady=2, sticky="w")
             self.range_vars[skey] = (mode_var, value_var, entry)
-            r += 1
+            self._toggle_range(skey)
 
-    def _toggle_range(self, mode_var, value_var, skey):
-        _, _, entry = self.range_vars[skey]
+    def _toggle_range(self, skey):
+        mode_var, _, entry = self.range_vars[skey]
         if mode_var.get() == "fixed":
             entry.config(state="normal", bg="white")
         else:
             entry.config(state="disabled", bg=BG_D)
+
+    def _reset_ranges(self):
+        for skey, (mode_var, value_var, _) in self.range_vars.items():
+            mode_var.set("fixed")
+            value_var.set(f"{cfg.default_delta_range(skey):g}")
+            self._toggle_range(skey)
 
     def refresh_scalars(self):
         self._rebuild_scalar_checks()
@@ -497,8 +630,10 @@ class CompareTab(ScrollableFrame):
         for skey, (mode_var, value_var, _) in self.range_vars.items():
             if mode_var.get() == "fixed":
                 try:
-                    result[skey] = float(value_var.get())
-                except ValueError:
+                    val = float(value_var.get())
+                    assert val > 0
+                    result[skey] = val
+                except (ValueError, AssertionError):
                     messagebox.showerror("Invalid range",
                         f"Fixed range for '{skey}' must be a positive number.")
                     return None
@@ -515,7 +650,7 @@ class CompareTab(ScrollableFrame):
         axes    = [k for k, v in self.axis_vars.items()   if v.get()]
         try:
             figh = float(self.v_figh.get()); dpi = int(self.v_dpi.get())
-        except:
+        except Exception:
             messagebox.showerror("Invalid size",
                                  "Figure height and DPI must be numbers."); return
         delta_ranges = self._get_delta_ranges()
@@ -544,9 +679,9 @@ class CompareTab(ScrollableFrame):
                     fig_height=figh, dpi=dpi,
                     delta_ranges=delta_ranges,
                 )
-                self.status_lbl.config(text="Done", fg="#2E7D32")
+                self.status_lbl.config(text="Done", fg=OK_FG)
             except Exception as exc:
-                self.status_lbl.config(text="Error", fg="#C62828")
+                self.status_lbl.config(text="Error", fg=ERR_FG)
                 print(f"\n[ERROR] {exc}")
                 import traceback; traceback.print_exc()
         threading.Thread(target=_worker, daemon=True).start()
@@ -618,6 +753,23 @@ class SettingsTab(ScrollableFrame):
                     .grid(row=r, column=col+1, padx=PAD_SM, pady=PAD_SM)
             self.bounds_vars[ax] = row_vars; r += 1
 
+        section_label(f, "View Orientation  (match the sim exports)", r); r += 2
+        hint(f, ("Mirror the horizontal plot axis per slice direction (display only — "
+                 "NPZ data is unchanged).\nDefault: X-slices are seen from the front "
+                 "looking rearward, so Y points left and Z up, like the STAR triad."),
+             r); r += 1
+        self.flip_vars = {}
+        ff = tk.Frame(f, bg=BG)
+        ff.grid(row=r, column=0, columnspan=3, sticky="w", padx=PAD)
+        for ax, txt in [(0, "X-slices: Y points left"),
+                        (1, "Y-slices: X points left"),
+                        (2, "Z-slices: X points left")]:
+            v = tk.BooleanVar(value=bool(cfg.FLIP_HORIZONTAL.get(ax, False)))
+            self.flip_vars[ax] = v
+            tk.Checkbutton(ff, text=txt, variable=v, font=FONT, bg=BG)\
+                .pack(side="left", padx=(0, PAD * 2))
+        r += 1
+
         section_label(f, "Plot Defaults", r); r += 2
         self.v_dpi   = tk.StringVar(value=str(cfg.DPI))
         self.v_fill  = tk.StringVar(value=cfg.FILL_COLOR)
@@ -628,7 +780,7 @@ class SettingsTab(ScrollableFrame):
         labeled_entry(f, "Tick spacing (mm)",      self.v_tick,  r, width=8); r += 1
         labeled_entry(f, "Geometry dilation (px)", self.v_dilat, r, width=8)
         tk.Label(f, text="increase to close gaps, decrease to reduce bloat",
-                 font=("Segoe UI", 8), bg=BG, fg="#888")\
+                 font=FONT_S, bg=BG, fg="#888")\
             .grid(row=r, column=2, sticky="w", padx=PAD_SM)
         r += 1
 
@@ -671,6 +823,25 @@ class SettingsTab(ScrollableFrame):
                       font=FONT, bg="#FFCDD2", relief="flat", cursor="hand2")\
                 .pack(side="left", padx=2)
 
+    def _refresh_all_tabs(self):
+        self._refresh_scalar_list()
+        self.app.run_tab.refresh_scalars()
+        self.app.compare_tab.refresh_scalars()
+        self.app.surface_tab.refresh_scalars()
+        self.app.surface_cp_tab.refresh_scalars()
+
+    @staticmethod
+    def _generic_cmap(key, vmin, vmax):
+        import matplotlib.colors as mcolors
+        mid = (vmin+vmax)/2
+        pos = [0.0, (mid-vmin)/(vmax-vmin), 1.0]
+        cdict = {
+            'red':   [(pos[0],0.0,0.0),(pos[1],1.0,1.0),(pos[2],0.8,0.8)],
+            'green': [(pos[0],0.0,0.0),(pos[1],1.0,1.0),(pos[2],0.0,0.0)],
+            'blue':  [(pos[0],0.8,0.8),(pos[1],1.0,1.0),(pos[2],0.0,0.0)],
+        }
+        return mcolors.LinearSegmentedColormap(f"auto_{key}", cdict, N=256)
+
     def _detect_scalars(self):
         data_path = self.app.run_tab.v_data.get().strip()
         if not data_path or not os.path.exists(data_path):
@@ -681,7 +852,6 @@ class SettingsTab(ScrollableFrame):
         self.update()
         try:
             import pyvista as pv
-            import matplotlib.colors as mcolors
             pv.global_theme.allow_empty_mesh = True
             mesh = pv.read(data_path)
             found = []
@@ -715,26 +885,17 @@ class SettingsTab(ScrollableFrame):
                 elif 'pressure' in arr_lower or 'cp' in arr_lower:
                     vmin, vmax = -3.0, 1.0
                 else:                           vmin, vmax = -1.0, 1.0
-                mid = (vmin+vmax)/2
-                pos = [0.0, (mid-vmin)/(vmax-vmin), 1.0]
-                cdict = {
-                    'red':   [(pos[0],0.0,0.0),(pos[1],1.0,1.0),(pos[2],0.8,0.8)],
-                    'green': [(pos[0],0.0,0.0),(pos[1],1.0,1.0),(pos[2],0.0,0.0)],
-                    'blue':  [(pos[0],0.8,0.8),(pos[1],1.0,1.0),(pos[2],0.0,0.0)],
-                }
-                cmap = mcolors.LinearSegmentedColormap(f"auto_{key}", cdict, N=256)
                 cfg.SCALARS[key] = {'array': arr, 'vmin': vmin, 'vmax': vmax,
-                                    'cmap': cmap, 'label': key}
+                                    'cmap': self._generic_cmap(key, vmin, vmax),
+                                    'label': key}
                 existing_arrays.add(arr); added.append(key)
-            self._refresh_scalar_list()
-            self.app.run_tab.refresh_scalars()
-            self.app.compare_tab.refresh_scalars()
+            self._refresh_all_tabs()
             if added:
-                self.detect_lbl.config(text=f"Added: {', '.join(added)}", fg="#2E7D32")
+                self.detect_lbl.config(text=f"Added: {', '.join(added)}", fg=OK_FG)
             else:
                 self.detect_lbl.config(text="All arrays already present", fg="#555")
         except Exception as exc:
-            self.detect_lbl.config(text="Error -- see Log tab", fg="#C62828")
+            self.detect_lbl.config(text="Error -- see Log tab", fg=ERR_FG)
             print(f"[detect_scalars] {exc}")
             import traceback; traceback.print_exc()
 
@@ -748,31 +909,33 @@ class SettingsTab(ScrollableFrame):
     def _remove_scalar(self, key):
         if messagebox.askyesno("Remove", f"Remove scalar '{key}'?"):
             del cfg.SCALARS[key]
-            self._refresh_scalar_list()
-            self.app.run_tab.refresh_scalars()
-            self.app.compare_tab.refresh_scalars()
+            self._refresh_all_tabs()
 
     def _on_scalar_saved(self, result):
-        import matplotlib.colors as mcolors
         vmin, vmax = result['vmin'], result['vmax']
-        mid = (vmin+vmax)/2
-        pos = [0.0, (mid-vmin)/(vmax-vmin), 1.0]
-        cdict = {
-            'red':   [(pos[0],0.0,0.0),(pos[1],1.0,1.0),(pos[2],0.8,0.8)],
-            'green': [(pos[0],0.0,0.0),(pos[1],1.0,1.0),(pos[2],0.0,0.0)],
-            'blue':  [(pos[0],0.8,0.8),(pos[1],1.0,1.0),(pos[2],0.0,0.0)],
-        }
-        cmap = mcolors.LinearSegmentedColormap(f"auto_{result['key']}", cdict, N=256)
-        if result['orig_key'] and result['orig_key'] != result['key']:
-            cfg.SCALARS.pop(result['orig_key'], None)
-        cfg.SCALARS[result['key']] = {
-            'array': result['array'], 'vmin': result['vmin'],
-            'vmax':  result['vmax'],  'cmap': cmap,
-            'label': result['label'],
-        }
-        self._refresh_scalar_list()
-        self.app.run_tab.refresh_scalars()
-        self.app.compare_tab.refresh_scalars()
+        key, orig = result['key'], result['orig_key']
+        old = cfg.SCALARS.get(orig) if orig else None
+
+        # Keep physics-informed palettes (e.g. the STAR Cp map) when editing:
+        # rebuild them for the new range instead of replacing them.
+        factory = cfg.CMAP_FACTORIES.get(orig or key)
+        if factory is not None:
+            cmap = factory(vmin=vmin, vmax=vmax)
+        elif old is not None and old.get('vmin') == vmin and old.get('vmax') == vmax:
+            cmap = old['cmap']
+        else:
+            cmap = self._generic_cmap(key, vmin, vmax)
+
+        if orig and orig != key:
+            cfg.SCALARS.pop(orig, None)
+        new = {'array': result['array'], 'vmin': vmin, 'vmax': vmax,
+               'cmap': cmap, 'label': result['label']}
+        cfg.SCALARS[key] = new
+        # Cp is shared with the surface tabs — keep them in sync
+        for sk, sd in list(cfg.SURFACE_SCALARS.items()):
+            if old is not None and sd is old:
+                cfg.SURFACE_SCALARS[sk] = new
+        self._refresh_all_tabs()
 
     def _apply(self):
         try:
@@ -783,14 +946,17 @@ class SettingsTab(ScrollableFrame):
             cfg.FILL_COLOR      = self.v_fill.get().strip()
             cfg.TICK_SPACING_MM = int(self.v_tick.get())
             cfg.DILATION_PX     = int(self.v_dilat.get())
+            for ax, v in self.flip_vars.items():
+                cfg.FLIP_HORIZONTAL[ax] = bool(v.get())
             import aero_report as ar
             ar.UNCERTAINTY_THRESHOLD = float(self.v_aero_thresh.get())
             ar.AEROBALANCE_TARGET    = float(self.v_aero_target.get())
             ar.FAILURE_ITERATIONS    = int(self.v_aero_failure.get())
-            self.status_lbl.config(text="Applied", fg="#2E7D32")
+            self.app.run_tab._update_recruits()
+            self.status_lbl.config(text="Applied", fg=OK_FG)
         except Exception as exc:
             messagebox.showerror("Settings error", str(exc))
-            self.status_lbl.config(text="Error", fg="#C62828")
+            self.status_lbl.config(text="Error", fg=ERR_FG)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -837,12 +1003,16 @@ class SurfaceTab(ScrollableFrame):
 
         # ── Single run ────────────────────────────────────────────
         section_label(f, "Single Run Surface Render", r); r += 2
+        hint(f, ("Full nodes: the CFD surface cells are rendered as-is with their "
+                 "exact values —\nno mapping onto the CAD geometry, no decimation, "
+                 "no interpolation."), r); r += 1
         self.v_geom    = tk.StringVar(value=cfg.GEOMETRY_CASE)
-        # Geometry and surface data are the same .case file
-        self.v_surface = self.v_geom
+        self.v_surface = tk.StringVar()
         self.v_out_png = tk.StringVar(value=cfg.OUTPUT_DIR)
         labeled_entry(f, "Geometry .case",     self.v_geom,    r,
                       browse=lambda: browse_file(self.v_geom));    r += 1
+        labeled_entry(f, "Surface data .case", self.v_surface, r,
+                      browse=lambda: browse_file(self.v_surface)); r += 1
         labeled_entry(f, "Output directory",   self.v_out_png, r,
                       browse=lambda: browse_dir(self.v_out_png));  r += 1
 
@@ -854,7 +1024,9 @@ class SurfaceTab(ScrollableFrame):
                                          values=list(cfg.SURFACE_SCALARS.keys()),
                                          width=20, state='readonly')
         self.scalar_menu.grid(row=r, column=1, sticky="w",
-                              padx=PAD, pady=PAD_SM); r += 1
+                              padx=PAD, pady=PAD_SM)
+        self.scalar_menu.bind("<<ComboboxSelected>>",
+                              lambda e: self._on_scalar_change()); r += 1
 
         tk.Label(f, text="Views", font=FONT, bg=BG, anchor="w")\
             .grid(row=r, column=0, sticky="nw", padx=PAD, pady=PAD_SM)
@@ -889,12 +1061,8 @@ class SurfaceTab(ScrollableFrame):
 
         # ── Per-part individual exports ───────────────────────────
         section_label(f, "Individual Part Exports  (auto-zoomed)", r); r += 2
-        tk.Label(f, text=(
-            "Ticked parts get their own separate PNGs per view,\n"
-            "auto-zoomed to fit just that component."),
-            font=("Segoe UI", 8), bg=BG, fg="#555")\
-            .grid(row=r, column=0, columnspan=3, sticky="w",
-                  padx=PAD, pady=PAD_SM); r += 1
+        hint(f, ("Ticked parts get their own separate PNGs per view,\n"
+                 "auto-zoomed to fit just that component."), r, fg="#555"); r += 1
 
         # Known parts — uses merged names for FW and RW
         self.PART_NAMES = [
@@ -917,7 +1085,6 @@ class SurfaceTab(ScrollableFrame):
                 .grid(row=i//3, column=i%3, sticky="w", padx=PAD_SM, pady=1)
         r += (len(self.PART_NAMES) + 2) // 3 + 1
 
-        # Select all / none helpers
         btn_sel = tk.Frame(f, bg=BG)
         btn_sel.grid(row=r, column=0, columnspan=3, sticky="w", padx=PAD)
         tk.Button(btn_sel, text="Select all",  font=FONT, bg=BG_D,
@@ -959,23 +1126,24 @@ class SurfaceTab(ScrollableFrame):
             .grid(row=r, column=0, sticky="w", padx=PAD, pady=PAD_SM)
         dr_frame = tk.Frame(f, bg=BG)
         dr_frame.grid(row=r, column=1, sticky="w", padx=PAD)
-        self.v_delta_mode = tk.StringVar(value="auto")
-        tk.Radiobutton(dr_frame, text="Auto", variable=self.v_delta_mode,
-                       value="auto", font=FONT, bg=BG,
-                       command=self._toggle_delta_range).pack(side="left")
+        self.v_delta_mode = tk.StringVar(value="fixed")
         tk.Radiobutton(dr_frame, text="Fixed:", variable=self.v_delta_mode,
                        value="fixed", font=FONT, bg=BG,
-                       command=self._toggle_delta_range)\
-            .pack(side="left", padx=(PAD,0))
-        self.v_delta_val = tk.StringVar(value="0.1")
+                       command=self._toggle_delta_range).pack(side="left")
+        self.v_delta_val = tk.StringVar(
+            value=f"{cfg.default_delta_range(self.v_scalar.get()):g}")
         self.delta_entry = tk.Entry(dr_frame, textvariable=self.v_delta_val,
-                                    width=7, font=FONT,
-                                    state="disabled", bg=BG_D)
-        self.delta_entry.pack(side="left", padx=PAD_SM); r += 1
+                                    width=7, font=FONT)
+        self.delta_entry.pack(side="left", padx=PAD_SM)
+        tk.Radiobutton(dr_frame, text="Auto", variable=self.v_delta_mode,
+                       value="auto", font=FONT, bg=BG,
+                       command=self._toggle_delta_range)\
+            .pack(side="left", padx=(PAD, 0))
+        r += 1
 
         tk.Label(f,
                  text="Geometry:  Gray=both  |  Magenta=new (B only)  |  Brown=removed (A only)",
-                 font=("Segoe UI", 8), bg=BG, fg="#555")\
+                 font=FONT_S, bg=BG, fg="#555")\
             .grid(row=r, column=0, columnspan=3, sticky="w",
                   padx=PAD, pady=PAD_SM); r += 1
 
@@ -1023,12 +1191,10 @@ class SurfaceTab(ScrollableFrame):
 
         # ── Interactive HTML export ───────────────────────────────
         section_label(f, "Interactive HTML  (open in any browser)", r); r += 2
-        tk.Label(f, text=(
-            "Exports a self-contained .html file — drag to rotate, scroll to zoom,\n"
-            "click legend to toggle parts on/off. No software installation required."),
-            font=("Segoe UI", 8), bg=BG, fg="#555")\
-            .grid(row=r, column=0, columnspan=3, sticky="w",
-                  padx=PAD, pady=PAD_SM); r += 1
+        hint(f, ("Exports a self-contained .html file — drag to rotate, scroll to zoom,\n"
+                 "click legend to toggle parts on/off. Full mesh: every CFD cell with "
+                 "its exact value\n(no decimation) — large cars give large files."),
+             r, fg="#555"); r += 1
 
         self.v_html_out = tk.StringVar()
         labeled_entry(f, "Output .html file", self.v_html_out, r,
@@ -1037,21 +1203,6 @@ class SurfaceTab(ScrollableFrame):
                               defaultextension=".html",
                               filetypes=[("HTML files", "*.html")],
                               initialfile="surface_Cp.html"))); r += 1
-
-        tk.Label(f, text="Quality", font=FONT, bg=BG, anchor="w")\
-            .grid(row=r, column=0, sticky="w", padx=PAD, pady=PAD_SM)
-        qf = tk.Frame(f, bg=BG)
-        qf.grid(row=r, column=1, sticky="w", padx=PAD)
-        self.v_html_quality = tk.StringVar(value="medium")
-        for i, (lbl, val, tip) in enumerate([
-            ("Low  (~5MB, fast)",    "low",    "20k tris/part"),
-            ("Medium  (~15MB)",      "medium", "60k tris/part"),
-            ("High  (~40MB, slow)",  "high",   "200k tris/part"),
-        ]):
-            tk.Radiobutton(qf, text=lbl, variable=self.v_html_quality,
-                           value=val, font=FONT, bg=BG)\
-                .grid(row=0, column=i, padx=PAD)
-        r += 1
 
         bf4 = tk.Frame(f, bg=BG)
         bf4.grid(row=r, column=0, columnspan=3, pady=PAD*2, padx=PAD, sticky="e")
@@ -1069,29 +1220,43 @@ class SurfaceTab(ScrollableFrame):
         else:
             self.delta_entry.config(state="disabled", bg=BG_D)
 
+    def _on_scalar_change(self):
+        self.v_delta_val.set(f"{cfg.default_delta_range(self.v_scalar.get()):g}")
+
     def refresh_scalars(self):
         keys = list(cfg.SURFACE_SCALARS.keys())
         self.scalar_menu['values'] = keys
         if keys and self.v_scalar.get() not in keys:
             self.v_scalar.set(keys[0])
+            self._on_scalar_change()
 
     def _get_views(self):
         return [v for v, bv in self.view_vars.items() if bv.get()] or None
 
+    def _angle(self):
+        try:
+            return float(self.v_angle.get())
+        except ValueError:
+            return 25.0
+
     def _run_single(self):
         geom    = self.v_geom.get().strip()
-        surface = geom or None
+        surface = self.v_surface.get().strip() or None
         out_dir = self.v_out_png.get().strip()
         skey    = self.v_scalar.get().strip()
         views   = self._get_views()
         parts_to_export = [p for p, v in self.part_vars.items() if v.get()]
         if not geom:
             messagebox.showwarning("Missing", "Set geometry .case path."); return
+        if not surface:
+            if not messagebox.askyesno("No surface data",
+                "Surface data .case is empty — geometry will render without "
+                "any scalar colouring (all grey).\n\nContinue anyway?"):
+                return
         try:
-            figh  = float(self.v_figh.get())
-            dpi   = int(self.v_dpi.get())
+            float(self.v_figh.get()); int(self.v_dpi.get())
             angle = float(self.v_angle.get())
-        except:
+        except Exception:
             messagebox.showerror("Invalid", "Height/DPI/angle must be numbers."); return
 
         self.status_single.config(text="Running...", fg=ACCENT)
@@ -1099,24 +1264,23 @@ class SurfaceTab(ScrollableFrame):
 
         def _worker():
             try:
-                import surface_render as sr, os
-                scfg = cfg.SURFACE_SCALARS.get(skey, cfg.SCALARS.get(skey, {}))
-                cmap = scfg.get('cmap', sr.make_cp_cmap())
-                clim = (scfg.get('vmin', -3.0), scfg.get('vmax', 1.0))
+                import surface_render as sr
+                scfg = surface_scalar_cfg(skey)
+                clim = (scfg.get('vmin', -4.0), scfg.get('vmax', 1.0))
+                cmap = scfg.get('cmap') or sr.make_cp_cmap(vmin=clim[0], vmax=clim[1])
                 arr  = scfg.get('array', skey)
+                label = scfg.get('label', skey)
                 stem = f'surface_{skey}'
 
                 prepared = sr.prepare_surfaces(
                     geom, surface, feature_angle=angle)
 
-                # Full car — one PNG per view
                 print(f"\n[surface] Rendering full-car views...")
                 sr.render_views(prepared, arr, cmap=cmap, clim=clim,
                                 views=views, window_size=(1600, 1000),
                                 bg_color='white',
-                                output_dir=out_dir, file_stem=stem)
+                                output_dir=out_dir, file_stem=stem, label=label)
 
-                # Per-part individual exports (auto-zoomed)
                 if parts_to_export:
                     print(f"\n[surface] Rendering {len(parts_to_export)} "
                           f"individual parts...")
@@ -1125,54 +1289,81 @@ class SurfaceTab(ScrollableFrame):
                         cmap=cmap, clim=clim,
                         views=views, window_size=(1600, 1000),
                         bg_color='white',
-                        output_dir=out_dir, file_stem=stem)
+                        output_dir=out_dir, file_stem=stem, label=label)
 
-                self.status_single.config(text="Done", fg="#2E7D32")
+                self.status_single.config(text="Done", fg=OK_FG)
             except Exception as exc:
-                self.status_single.config(text="Error", fg="#C62828")
+                self.status_single.config(text="Error", fg=ERR_FG)
                 print(f"\n[ERROR] {exc}")
                 import traceback; traceback.print_exc()
         threading.Thread(target=_worker, daemon=True).start()
 
     def _run_delta(self):
+        geom   = self.v_geom.get().strip()
         surf_a = self.v_surf_a.get().strip()
         surf_b = self.v_surf_b.get().strip()
         out    = self.v_out_delta.get().strip()
         skey   = self.v_scalar.get().strip()
         views  = self._get_views()
-        if not surf_a or not surf_b:
+        if not geom or not surf_a or not surf_b:
             messagebox.showwarning("Missing",
-                "Set both surface .case paths (A and B)."); return
+                "Set geometry and both surface .case paths."); return
         fixed_range = None
         if self.v_delta_mode.get() == "fixed":
-            try: fixed_range = float(self.v_delta_val.get())
-            except:
-                messagebox.showerror("Invalid", "Fixed range must be a number.")
+            try:
+                fixed_range = float(self.v_delta_val.get()); assert fixed_range > 0
+            except Exception:
+                messagebox.showerror("Invalid", "Fixed range must be a positive number.")
                 return
-        scfg = cfg.SURFACE_SCALARS.get(skey, cfg.SCALARS.get(skey, {}))
+        scfg = surface_scalar_cfg(skey)
         arr  = scfg.get('array', skey)
         la   = self.v_label_a.get() or "Run A"
         lb   = self.v_label_b.get() or "Run B"
+        angle = self._angle()
         self.status_delta.config(text="Running...", fg=ACCENT)
         self.app.notebook.select(self.app.log_tab)
 
         def _worker():
             try:
-                import surface_render as sr
-                angle = float(self.v_angle.get()) if self.v_angle.get() else 25.0
-                stem  = f'surface_delta_{skey}'
+                import surface_render as sr, matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt, matplotlib.colors as mc2
+                import plotting
                 print("[surface] Preparing Run A...")
-                prep_a = sr.prepare_surfaces(surf_a, surf_a, feature_angle=angle)
+                prep_a = sr.prepare_surfaces(geom, surf_a, feature_angle=angle)
                 print("[surface] Preparing Run B...")
-                prep_b = sr.prepare_surfaces(surf_b, surf_b, feature_angle=angle)
-                print("[surface] Rendering delta views (one PNG per view)...")
-                sr.render_delta_views(
+                prep_b = sr.prepare_surfaces(geom, surf_b, feature_angle=angle)
+                imgs, clim = sr.render_delta_views(
                     prep_a, prep_b, arr, label_a=la, label_b=lb,
-                    views=views, fixed_range=fixed_range, bg_color='white',
-                    output_dir=out or '.', file_stem=stem)
-                self.status_delta.config(text="Done", fg="#2E7D32")
+                    views=views, fixed_range=fixed_range, bg_color='white')
+                os.makedirs(out or '.', exist_ok=True)
+                n = len(imgs); cols = min(n,3); rows = (n+cols-1)//cols
+                figh = float(self.v_figh.get()) if self.v_figh.get() else 7.0
+                dpi  = int(self.v_dpi.get()) if self.v_dpi.get() else 150
+                fig, axes = plt.subplots(rows, cols,
+                                          figsize=(cols*10, rows*figh))
+                fig.patch.set_facecolor('white')
+                af = list(axes.flat) if hasattr(axes,'flat') else [axes]
+                for ax,(vname,img) in zip(af,imgs.items()):
+                    ax.imshow(img); ax.axis('off')
+                    ax.set_title(vname.replace('_',' ').title(),
+                                 color='black', fontsize=11)
+                for ax in af[n:]: ax.axis('off')
+                sm = plt.cm.ScalarMappable(cmap='RdBu_r',
+                     norm=mc2.Normalize(vmin=clim[0],vmax=clim[1]))
+                sm.set_array([])
+                cbar = fig.colorbar(sm, ax=af, fraction=0.01, pad=0.02,
+                                    label=f'delta {skey}  ({lb} - {la})')
+                plotting.style_colorbar(cbar, clim[0], clim[1])
+                plt.suptitle(f'Surface Delta -- {skey}  {lb} - {la}', fontsize=14)
+                out_path = os.path.join(out or '.', f'surface_delta_{skey}.png')
+                fig.savefig(out_path, dpi=dpi, facecolor='white',
+                            bbox_inches='tight')
+                plt.close(fig)
+                print(f"[surface] Saved -> {out_path}")
+                self.status_delta.config(text="Done", fg=OK_FG)
             except Exception as exc:
-                self.status_delta.config(text="Error", fg="#C62828")
+                self.status_delta.config(text="Error", fg=ERR_FG)
                 print(f"\n[ERROR] {exc}")
                 import traceback; traceback.print_exc()
         threading.Thread(target=_worker, daemon=True).start()
@@ -1187,22 +1378,24 @@ class SurfaceTab(ScrollableFrame):
             messagebox.showwarning("Missing", "Set geometry .case path."); return
         if not out_dir:
             messagebox.showwarning("Missing", "Set output directory."); return
+        angle = self._angle()
         self.status_export.config(text="Running...", fg=ACCENT)
         self.app.notebook.select(self.app.log_tab)
 
         def _worker():
             try:
                 import surface_render as sr
-                angle = float(self.v_angle.get()) if self.v_angle.get() else 25.0
                 prepared = sr.prepare_surfaces(geom, surface, feature_angle=angle)
-                scalar_keys = [sd['array'] for sd in
-                               {**cfg.SCALARS, **cfg.SURFACE_SCALARS}.values()] \
-                              if surface else None
+                scalar_keys = None
+                if surface:
+                    scalar_keys = sorted({sd['array'] for sd in
+                                          list(cfg.SCALARS.values()) +
+                                          list(cfg.SURFACE_SCALARS.values())})
                 sr.export_3d(prepared, scalar_keys=scalar_keys,
                              output_dir=out_dir, fmt=fmt, merged=merged)
-                self.status_export.config(text="Done", fg="#2E7D32")
+                self.status_export.config(text="Done", fg=OK_FG)
             except Exception as exc:
-                self.status_export.config(text="Error", fg="#C62828")
+                self.status_export.config(text="Error", fg=ERR_FG)
                 print(f"\n[ERROR] {exc}")
                 import traceback; traceback.print_exc()
         threading.Thread(target=_worker, daemon=True).start()
@@ -1212,7 +1405,6 @@ class SurfaceTab(ScrollableFrame):
         surface = self.v_surface.get().strip() or None
         out_path = self.v_html_out.get().strip()
         skey    = self.v_scalar.get().strip()
-        quality = self.v_html_quality.get()
 
         if not geom:
             messagebox.showwarning("Missing", "Set geometry .case path."); return
@@ -1222,14 +1414,12 @@ class SurfaceTab(ScrollableFrame):
             messagebox.showwarning("Missing",
                 "Set a surface data .case file to colour by scalars."); return
 
-        quality_map = {'low': 20_000, 'medium': 60_000, 'high': 200_000}
-        tris = quality_map.get(quality, 60_000)
-
-        scfg  = cfg.SURFACE_SCALARS.get(skey, cfg.SCALARS.get(skey, {}))
+        scfg  = surface_scalar_cfg(skey)
         arr   = scfg.get('array', skey)
         cmap  = scfg.get('cmap', None)
-        clim  = (scfg.get('vmin', -3.0), scfg.get('vmax', 1.0))
+        clim  = (scfg.get('vmin', -4.0), scfg.get('vmax', 1.0))
         label = scfg.get('label', skey)
+        angle = self._angle()
 
         self.status_html.config(text="Running...", fg=ACCENT)
         self.app.notebook.select(self.app.log_tab)
@@ -1237,19 +1427,289 @@ class SurfaceTab(ScrollableFrame):
         def _worker():
             try:
                 import surface_render as sr
-                angle = float(self.v_angle.get()) if self.v_angle.get() else 25.0
                 prepared = sr.prepare_surfaces(geom, surface, feature_angle=angle)
                 sr.export_interactive_html(
                     prepared, arr,
                     cmap=cmap, clim=clim, label=label,
                     output_path=out_path,
-                    triangles_per_part=tris,
                 )
-                self.status_html.config(text="Done", fg="#2E7D32")
+                self.status_html.config(text="Done", fg=OK_FG)
             except Exception as exc:
-                self.status_html.config(text="Error", fg="#C62828")
+                self.status_html.config(text="Error", fg=ERR_FG)
                 print(f"\n[ERROR] {exc}")
                 import traceback; traceback.print_exc()
+        threading.Thread(target=_worker, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TAB: SURFACE CP  (Cp along any slice — export)
+# ══════════════════════════════════════════════════════════════════
+
+class SurfaceCpTab(ScrollableFrame):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self._parts = None          # cached surface (full nodes)
+        self._parts_path = None
+        self._busy = False
+        self._build(self.inner)
+
+    def _build(self, f):
+        f.columnconfigure(1, weight=1)
+        r = 0
+
+        section_label(f, "Surface Data", r); r += 2
+        hint(f, ("Cuts the CFD surface mesh exactly at each slice. Every point is a "
+                 "real CFD cell value (or exact node\nvalue for node-based exports) — "
+                 "full nodes, nothing interpolated, resampled or smoothed."), r); r += 1
+        self.v_surface = tk.StringVar()
+        self.v_out     = tk.StringVar(value=cfg.OUTPUT_DIR)
+        labeled_entry(f, "Surface data .case", self.v_surface, r,
+                      browse=lambda: browse_file(self.v_surface)); r += 1
+        labeled_entry(f, "Output directory", self.v_out, r,
+                      browse=lambda: browse_dir(self.v_out)); r += 1
+
+        lf = tk.Frame(f, bg=BG)
+        lf.grid(row=r, column=1, columnspan=2, sticky="w", padx=PAD, pady=PAD_SM)
+        tk.Button(lf, text="Load parts", command=self._load_parts,
+                  **BTN_SEC).pack(side="left")
+        tk.Button(lf, text="Use path from Surface tab", font=FONT, bg=BG_D,
+                  relief="flat", cursor="hand2",
+                  command=self._copy_from_surface_tab)\
+            .pack(side="left", padx=PAD)
+        self.load_lbl = tk.Label(lf, text="", font=FONT, bg=BG, fg="#555")
+        self.load_lbl.pack(side="left", padx=PAD)
+        r += 1
+
+        section_label(f, "Slice", r); r += 2
+        tk.Label(f, text="Scalar", font=FONT, bg=BG, anchor="w")\
+            .grid(row=r, column=0, sticky="w", padx=PAD, pady=PAD_SM)
+        self.v_scalar = tk.StringVar(
+            value=list(cfg.SURFACE_SCALARS.keys())[0] if cfg.SURFACE_SCALARS else 'Cp')
+        self.scalar_menu = ttk.Combobox(f, textvariable=self.v_scalar,
+                                        values=list(cfg.SURFACE_SCALARS.keys()),
+                                        width=20, state='readonly')
+        self.scalar_menu.grid(row=r, column=1, sticky="w", padx=PAD, pady=PAD_SM)
+        r += 1
+
+        tk.Label(f, text="Slice normal", font=FONT, bg=BG, anchor="w")\
+            .grid(row=r, column=0, sticky="w", padx=PAD, pady=PAD_SM)
+        axf = tk.Frame(f, bg=BG)
+        axf.grid(row=r, column=1, sticky="w", padx=PAD)
+        self.v_axis = tk.StringVar(value="Y")
+        for ax, desc in [("X", "X  (plot vs Y — spanwise)"),
+                         ("Y", "Y  (plot vs X — chordwise)"),
+                         ("Z", "Z  (plot vs X — plan view)")]:
+            tk.Radiobutton(axf, text=desc, variable=self.v_axis, value=ax,
+                           font=FONT, bg=BG).pack(side="left", padx=(0, PAD))
+        r += 1
+
+        tk.Label(f, text="Positions (mm)", font=FONT, bg=BG, anchor="w")\
+            .grid(row=r, column=0, sticky="w", padx=PAD, pady=PAD_SM)
+        self.v_positions = tk.StringVar(value="0, 150, 300, 450")
+        tk.Entry(f, textvariable=self.v_positions, width=40, font=FONT)\
+            .grid(row=r, column=1, sticky="ew", padx=(PAD, PAD), pady=PAD_SM)
+        r += 1
+        hint(f, ("Comma-separated and/or ranges start:stop:step   "
+                 "e.g.   100, 250, -400   or   0:600:50"), r, col=1, colspan=2); r += 1
+
+        section_label(f, "Parts", r); r += 2
+        self.parts_frame = tk.Frame(f, bg=BG)
+        self.parts_frame.grid(row=r, column=0, columnspan=3, sticky="ew", padx=PAD)
+        self.part_vars = {}
+        tk.Label(self.parts_frame, text="Click 'Load parts' to choose parts "
+                 "(all parts are used if none are loaded).",
+                 font=FONT_S, bg=BG, fg="#888").grid(row=0, column=0, sticky="w")
+        r += 1
+        sel = tk.Frame(f, bg=BG)
+        sel.grid(row=r, column=0, columnspan=3, sticky="w", padx=PAD)
+        tk.Button(sel, text="Select all", font=FONT, bg=BG_D, relief="flat",
+                  cursor="hand2",
+                  command=lambda: [v.set(True) for v in self.part_vars.values()])\
+            .pack(side="left", padx=PAD_SM)
+        tk.Button(sel, text="Select none", font=FONT, bg=BG_D, relief="flat",
+                  cursor="hand2",
+                  command=lambda: [v.set(False) for v in self.part_vars.values()])\
+            .pack(side="left", padx=PAD_SM)
+        r += 1
+
+        section_label(f, "Plot Options", r); r += 2
+        of = tk.Frame(f, bg=BG)
+        of.grid(row=r, column=0, columnspan=3, sticky="w", padx=PAD)
+        self.v_invert  = tk.BooleanVar(value=True)
+        self.v_profile = tk.BooleanVar(value=True)
+        self.v_csv     = tk.BooleanVar(value=True)
+        tk.Checkbutton(of, text="Invert value axis (suction up)",
+                       variable=self.v_invert, font=FONT, bg=BG)\
+            .pack(side="left", padx=(0, PAD))
+        tk.Checkbutton(of, text="Section profile coloured by value",
+                       variable=self.v_profile, font=FONT, bg=BG)\
+            .pack(side="left", padx=(0, PAD))
+        tk.Checkbutton(of, text="Export CSV (every point)",
+                       variable=self.v_csv, font=FONT, bg=BG)\
+            .pack(side="left")
+        r += 1
+
+        def _pair(label, row, a, b, unit):
+            tk.Label(f, text=label, font=FONT, bg=BG, anchor="w")\
+                .grid(row=row, column=0, sticky="w", padx=PAD, pady=PAD_SM)
+            pf = tk.Frame(f, bg=BG)
+            pf.grid(row=row, column=1, sticky="w", padx=PAD)
+            tk.Label(pf, text="min", font=FONT, bg=BG).pack(side="left")
+            tk.Entry(pf, textvariable=a, width=8, font=FONT).pack(side="left", padx=PAD_SM)
+            tk.Label(pf, text="max", font=FONT, bg=BG).pack(side="left", padx=(PAD, 0))
+            tk.Entry(pf, textvariable=b, width=8, font=FONT).pack(side="left", padx=PAD_SM)
+            tk.Label(pf, text=unit, font=FONT_S, bg=BG, fg="#888").pack(side="left", padx=PAD)
+
+        self.v_hmin, self.v_hmax = tk.StringVar(), tk.StringVar()
+        self.v_cmin, self.v_cmax = tk.StringVar(), tk.StringVar()
+        _pair("Horizontal limits", r, self.v_hmin, self.v_hmax,
+              "metres, blank = auto (use to zoom on one component)"); r += 1
+        _pair("Value axis limits", r, self.v_cmin, self.v_cmax,
+              "blank = auto"); r += 1
+
+        tk.Label(f, text="Figure size (in) / DPI", font=FONT, bg=BG, anchor="w")\
+            .grid(row=r, column=0, sticky="w", padx=PAD, pady=PAD_SM)
+        sf = tk.Frame(f, bg=BG)
+        sf.grid(row=r, column=1, sticky="w", padx=PAD)
+        self.v_figw = tk.StringVar(value="12")
+        self.v_figh = tk.StringVar(value="8")
+        self.v_dpi  = tk.StringVar(value=str(cfg.DPI))
+        for lbl, var in (("W", self.v_figw), ("H", self.v_figh), ("DPI", self.v_dpi)):
+            tk.Label(sf, text=lbl, font=FONT, bg=BG).pack(side="left")
+            tk.Entry(sf, textvariable=var, width=6, font=FONT)\
+                .pack(side="left", padx=(PAD_SM, PAD))
+        r += 1
+
+        hint(f, ("Output:  <output>/SurfaceCp/<scalar>/<axis>/"
+                 "surfcp_<scalar>_<axis>_<pos>mm.png  (+ .csv)"), r, fg="#888"); r += 1
+
+        bf = tk.Frame(f, bg=BG)
+        bf.grid(row=r, column=0, columnspan=3, pady=PAD*2, padx=PAD, sticky="e")
+        tk.Button(bf, text="Export Surface Cp Plots", command=self._run,
+                  **BTN_RUN).pack(side="right")
+        self.status_lbl = tk.Label(bf, text="", font=FONT, bg=BG, fg="#555")
+        self.status_lbl.pack(side="right", padx=PAD)
+
+    # ── helpers ───────────────────────────────────────────────────
+    def refresh_scalars(self):
+        keys = list(cfg.SURFACE_SCALARS.keys())
+        self.scalar_menu['values'] = keys
+        if keys and self.v_scalar.get() not in keys:
+            self.v_scalar.set(keys[0])
+
+    def _copy_from_surface_tab(self):
+        p = self.app.surface_tab.v_surface.get().strip()
+        if p:
+            self.v_surface.set(p)
+        else:
+            messagebox.showinfo("Surface tab",
+                                "No surface data .case set in the Surface tab.")
+
+    def _ensure_loaded(self, path):
+        """Load (or reuse) the full-node surface. Runs in a worker thread."""
+        import surface_cp as sc
+        if self._parts is None or self._parts_path != path:
+            self._parts = sc.load_surface(path)
+            self._parts_path = path
+        return self._parts
+
+    def _populate_parts(self, parts):
+        for w in self.parts_frame.winfo_children():
+            w.destroy()
+        old = {k: v.get() for k, v in self.part_vars.items()}
+        self.part_vars = {}
+        for i, p in enumerate(parts):
+            v = tk.BooleanVar(value=old.get(p['name'], True))
+            self.part_vars[p['name']] = v
+            tk.Checkbutton(self.parts_frame,
+                           text=f"{p['name']}  ({p['mesh'].n_cells:,})",
+                           variable=v, font=FONT, bg=BG)\
+                .grid(row=i // 3, column=i % 3, sticky="w", padx=PAD_SM, pady=1)
+
+    def _load_parts(self):
+        path = self.v_surface.get().strip()
+        if not path:
+            messagebox.showwarning("Missing", "Set the surface data .case path."); return
+        if self._busy:
+            return
+        self._busy = True
+        self.load_lbl.config(text="Loading...", fg=ACCENT)
+
+        def _worker():
+            try:
+                parts = self._ensure_loaded(path)
+                n = sum(p['mesh'].n_cells for p in parts)
+                self.app.ui(lambda: (self._populate_parts(parts),
+                                       self.load_lbl.config(
+                                           text=f"{len(parts)} parts · {n:,} cells",
+                                           fg=OK_FG)))
+            except Exception as exc:
+                self.app.ui(lambda: self.load_lbl.config(
+                    text="Error — see Log tab", fg=ERR_FG))
+                print(f"\n[ERROR] {exc}")
+                import traceback; traceback.print_exc()
+            finally:
+                self._busy = False
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _run(self):
+        import surface_cp as sc
+        path = self.v_surface.get().strip()
+        out  = self.v_out.get().strip()
+        if not path:
+            messagebox.showwarning("Missing", "Set the surface data .case path."); return
+        if not out:
+            messagebox.showwarning("Missing", "Set the output directory."); return
+        try:
+            positions = sc.parse_positions(self.v_positions.get())
+            assert positions
+        except Exception as exc:
+            messagebox.showerror("Positions",
+                                 f"Could not read the slice positions.\n\n{exc}")
+            return
+        try:
+            h_lim = (_float_or_none(self.v_hmin.get()), _float_or_none(self.v_hmax.get()))
+            h_lim = h_lim if None not in h_lim else None
+            v_lim = (_float_or_none(self.v_cmin.get()), _float_or_none(self.v_cmax.get()))
+            v_lim = v_lim if None not in v_lim else None
+            fig_size = (float(self.v_figw.get()), float(self.v_figh.get()))
+            dpi = int(self.v_dpi.get())
+        except ValueError:
+            messagebox.showerror("Invalid", "Limits, figure size and DPI must be numbers.")
+            return
+        if self._busy:
+            return
+        selected = [k for k, v in self.part_vars.items() if v.get()] or None
+        if self.part_vars and not selected:
+            messagebox.showwarning("Parts", "Select at least one part."); return
+
+        skey = self.v_scalar.get().strip()
+        axis = self.v_axis.get()
+        opts = dict(part_names=selected, invert=self.v_invert.get(),
+                    h_lim=h_lim, val_lim=v_lim,
+                    show_profile=self.v_profile.get(),
+                    write_csv_files=self.v_csv.get(),
+                    fig_size=fig_size, dpi=dpi)
+        self._busy = True
+        self.status_lbl.config(text="Running...", fg=ACCENT)
+        self.app.notebook.select(self.app.log_tab)
+
+        def _worker():
+            try:
+                parts = self._ensure_loaded(path)
+                if not self.part_vars:
+                    self.app.ui(lambda: self._populate_parts(parts))
+                files = sc.export_sections(parts, axis, positions, skey, out, **opts)
+                n_png = sum(1 for p in files if p.endswith('.png'))
+                self.app.ui(lambda: self.status_lbl.config(
+                    text=f"Done — {n_png} plot{'s' if n_png != 1 else ''}", fg=OK_FG))
+            except Exception as exc:
+                self.app.ui(lambda: self.status_lbl.config(text="Error", fg=ERR_FG))
+                print(f"\n[ERROR] {exc}")
+                import traceback; traceback.print_exc()
+            finally:
+                self._busy = False
         threading.Thread(target=_worker, daemon=True).start()
 
 
@@ -1262,7 +1722,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("CFD Slicer")
         self.configure(bg=BG)
-        self.geometry("820x700")
+        self.geometry("860x720")
         self.minsize(700, 500)
 
         hdr = tk.Frame(self, bg=ACCENT, height=48)
@@ -1285,20 +1745,26 @@ class App(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=PAD, pady=PAD)
 
-        self.run_tab      = RunTab(self.notebook, self)
-        self.compare_tab  = CompareTab(self.notebook, self)
-        self.surface_tab  = SurfaceTab(self.notebook, self)
-        self.settings_tab = SettingsTab(self.notebook, self)
-        self.log_tab      = LogTab(self.notebook, self)
+        self.run_tab        = RunTab(self.notebook, self)
+        self.compare_tab    = CompareTab(self.notebook, self)
+        self.surface_tab    = SurfaceTab(self.notebook, self)
+        self.surface_cp_tab = SurfaceCpTab(self.notebook, self)
+        self.settings_tab   = SettingsTab(self.notebook, self)
+        self.log_tab        = LogTab(self.notebook, self)
 
-        self.notebook.add(self.run_tab,      text="  Run  ")
-        self.notebook.add(self.compare_tab,  text="  Compare  ")
-        self.notebook.add(self.surface_tab,  text="  Surface  ")
-        self.notebook.add(self.settings_tab, text="  Settings  ")
-        self.notebook.add(self.log_tab,      text="  Log  ")
+        self.notebook.add(self.run_tab,        text="  Run  ")
+        self.notebook.add(self.compare_tab,    text="  Compare  ")
+        self.notebook.add(self.surface_tab,    text="  Surface  ")
+        self.notebook.add(self.surface_cp_tab, text="  Surface Cp  ")
+        self.notebook.add(self.settings_tab,   text="  Settings  ")
+        self.notebook.add(self.log_tab,        text="  Log  ")
 
         redir = LogRedirector(self.log_tab.log_text, sys.stdout)
         sys.stdout = redir
+
+        # Worker threads hand UI updates to the main thread through a queue
+        self._ui_queue = queue.Queue()
+        self._pump_ui()
 
         # ── Watermark / status bar ───────────────────────────────
         bar = tk.Frame(self, bg=BG_D)
@@ -1306,11 +1772,29 @@ class App(tk.Tk):
         tk.Label(bar, text="Ready", font=FONT, bg=BG_D,
                  fg="#555", anchor="w")            .pack(side="left", padx=PAD)
         tk.Label(bar, text="Julian G-A  ·  UTFR",
-                 font=("Segoe UI", 8), bg=BG_D,
+                 font=FONT_S, bg=BG_D,
                  fg="#999", anchor="e")            .pack(side="right", padx=PAD)
 
 
+    def ui(self, fn):
+        """Run fn() on the Tk main thread (safe to call from worker threads)."""
+        self._ui_queue.put(fn)
+
+    def _pump_ui(self):
+        try:
+            while True:
+                fn = self._ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception as exc:
+                    print(f"[ui] {exc}")
+        except queue.Empty:
+            pass
+        self.after(50, self._pump_ui)
+
+
 def main():
+    multiprocessing.freeze_support()     # recruits in a frozen .exe
     App().mainloop()
 
 

@@ -295,6 +295,9 @@ FILL_COLOR      = "#404040"   # solid geometry fill
 BG_COLOR        = "white"
 TICK_SPACING_MM = 100         # axis tick marks every N mm
 COLORBAR_TICKS  = 5           # STAR-style: evenly spaced, '<' / '>' on the ends
+SURFACE_PARALLEL_PROJECTION = True   # surface renders + HTML: parallel (orthographic) view
+SURFACE_COLOR_BANDS = 50             # surface renders/deltas/HTML: solid colour bands,
+                                     # evenly spread over the range (0 = smooth)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -342,6 +345,8 @@ def runtime_snapshot():
         DPI=DPI, FILL_COLOR=FILL_COLOR, BG_COLOR=BG_COLOR,
         TICK_SPACING_MM=TICK_SPACING_MM, COLORBAR_TICKS=COLORBAR_TICKS,
         FLIP_HORIZONTAL=dict(FLIP_HORIZONTAL),
+        SURFACE_PARALLEL_PROJECTION=SURFACE_PARALLEL_PROJECTION,
+        SURFACE_COLOR_BANDS=SURFACE_COLOR_BANDS,
     )
 
 

@@ -156,12 +156,39 @@ def _float_or_none(s):
 # ══════════════════════════════════════════════════════════════════
 
 class LogRedirector:
+    """
+    stdout -> Log tab. Worker threads only queue their text (they never
+    touch Tk, so a busy GUI can't slow them down); the main thread inserts
+    it from App._pump_ui.
+    """
     def __init__(self, widget, original):
         self.widget = widget; self.original = original
+        self._q = queue.Queue()
+        self._main = threading.main_thread()
+
     def write(self, text):
         if self.original is not None:
             try: self.original.write(text)
             except Exception: pass
+        if threading.current_thread() is self._main:
+            self.drain()
+            self._insert(text)
+        else:
+            self._q.put(text)
+
+    def drain(self):
+        chunks = []
+        try:
+            while True:
+                chunks.append(self._q.get_nowait())
+        except queue.Empty:
+            pass
+        if chunks:
+            self._insert(''.join(chunks))
+
+    def _insert(self, text):
+        if not text:
+            return
         try:
             self.widget.configure(state="normal")
             self.widget.insert("end", text)
@@ -169,6 +196,7 @@ class LogRedirector:
             self.widget.configure(state="disabled")
         except Exception:
             pass
+
     def flush(self):
         if self.original is not None:
             try: self.original.flush()
@@ -1005,7 +1033,9 @@ class SurfaceTab(ScrollableFrame):
         section_label(f, "Single Run Surface Render", r); r += 2
         hint(f, ("Full nodes: the CFD surface cells are rendered as-is with their "
                  "exact values —\nno mapping onto the CAD geometry, no decimation, "
-                 "no interpolation."), r); r += 1
+                 "no interpolation.\nOnly the parts of the Geometry .case are drawn "
+                 "(plane sections are never shown).\nLeave 'Surface data .case' empty "
+                 "to use the Cp/Cf stored in the Geometry .case."), r); r += 1
         self.v_geom    = tk.StringVar(value=cfg.GEOMETRY_CASE)
         self.v_surface = tk.StringVar()
         self.v_out_png = tk.StringVar(value=cfg.OUTPUT_DIR)
@@ -1058,6 +1088,33 @@ class SurfaceTab(ScrollableFrame):
         self.v_angle = tk.StringVar(value="25")
         tk.Entry(f, textvariable=self.v_angle, width=6, font=FONT)\
             .grid(row=r, column=1, sticky="w", padx=PAD, pady=PAD_SM); r += 1
+
+        self.v_parallel = tk.BooleanVar(value=bool(cfg.SURFACE_PARALLEL_PROJECTION))
+        tk.Checkbutton(f, text="Parallel projection (orthographic) — "
+                               "untick for perspective",
+                       variable=self.v_parallel, font=FONT, bg=BG,
+                       command=lambda: setattr(cfg, 'SURFACE_PARALLEL_PROJECTION',
+                                               bool(self.v_parallel.get())))\
+            .grid(row=r, column=0, columnspan=3, sticky="w", padx=PAD); r += 1
+
+        tk.Label(f, text="Colour bands", font=FONT, bg=BG, anchor="w")\
+            .grid(row=r, column=0, sticky="w", padx=PAD, pady=PAD_SM)
+        bandf = tk.Frame(f, bg=BG)
+        bandf.grid(row=r, column=1, columnspan=2, sticky="w", padx=PAD)
+        self.v_bands = tk.StringVar(value=str(cfg.SURFACE_COLOR_BANDS))
+        tk.Spinbox(bandf, from_=0, to=256, increment=1, width=6, font=FONT,
+                   textvariable=self.v_bands).pack(side="left")
+        tk.Label(bandf, text="solid colours, evenly spread over the range "
+                             "(renders, delta, HTML) — 0 = smooth",
+                 font=FONT_S, bg=BG, fg="#888").pack(side="left", padx=PAD)
+
+        def _set_bands(*_):
+            try:
+                cfg.SURFACE_COLOR_BANDS = max(0, int(self.v_bands.get()))
+            except ValueError:
+                pass
+        self.v_bands.trace_add("write", _set_bands)
+        r += 1
 
         # ── Per-part individual exports ───────────────────────────
         section_label(f, "Individual Part Exports  (auto-zoomed)", r); r += 2
@@ -1248,11 +1305,6 @@ class SurfaceTab(ScrollableFrame):
         parts_to_export = [p for p, v in self.part_vars.items() if v.get()]
         if not geom:
             messagebox.showwarning("Missing", "Set geometry .case path."); return
-        if not surface:
-            if not messagebox.askyesno("No surface data",
-                "Surface data .case is empty — geometry will render without "
-                "any scalar colouring (all grey).\n\nContinue anyway?"):
-                return
         try:
             float(self.v_figh.get()); int(self.v_dpi.get())
             angle = float(self.v_angle.get())
@@ -1349,7 +1401,7 @@ class SurfaceTab(ScrollableFrame):
                     ax.set_title(vname.replace('_',' ').title(),
                                  color='black', fontsize=11)
                 for ax in af[n:]: ax.axis('off')
-                sm = plt.cm.ScalarMappable(cmap='RdBu_r',
+                sm = plt.cm.ScalarMappable(cmap=sr.banded_cmap('RdBu_r'),
                      norm=mc2.Normalize(vmin=clim[0],vmax=clim[1]))
                 sm.set_array([])
                 cbar = fig.colorbar(sm, ax=af, fraction=0.01, pad=0.02,
@@ -1410,9 +1462,6 @@ class SurfaceTab(ScrollableFrame):
             messagebox.showwarning("Missing", "Set geometry .case path."); return
         if not out_path:
             messagebox.showwarning("Missing", "Set output .html file path."); return
-        if not surface:
-            messagebox.showwarning("Missing",
-                "Set a surface data .case file to colour by scalars."); return
 
         scfg  = surface_scalar_cfg(skey)
         arr   = scfg.get('array', skey)
@@ -1461,9 +1510,15 @@ class SurfaceCpTab(ScrollableFrame):
         section_label(f, "Surface Data", r); r += 2
         hint(f, ("Cuts the CFD surface mesh exactly at each slice. Every point is a "
                  "real CFD cell value (or exact node\nvalue for node-based exports) — "
-                 "full nodes, nothing interpolated, resampled or smoothed."), r); r += 1
+                 "full nodes, nothing interpolated, resampled or smoothed.\n"
+                 "The Geometry .case parts are always the parts listed. Leave 'Surface data "
+                 ".case' empty to use the Cp/Cf\nstored in the Geometry .case — plane "
+                 "files such as Raw_Data.case are ignored here."), r); r += 1
+        self.v_geom    = tk.StringVar(value=cfg.GEOMETRY_CASE)
         self.v_surface = tk.StringVar()
         self.v_out     = tk.StringVar(value=cfg.OUTPUT_DIR)
+        labeled_entry(f, "Geometry .case", self.v_geom, r,
+                      browse=lambda: browse_file(self.v_geom)); r += 1
         labeled_entry(f, "Surface data .case", self.v_surface, r,
                       browse=lambda: browse_file(self.v_surface)); r += 1
         labeled_entry(f, "Output directory", self.v_out, r,
@@ -1473,7 +1528,7 @@ class SurfaceCpTab(ScrollableFrame):
         lf.grid(row=r, column=1, columnspan=2, sticky="w", padx=PAD, pady=PAD_SM)
         tk.Button(lf, text="Load parts", command=self._load_parts,
                   **BTN_SEC).pack(side="left")
-        tk.Button(lf, text="Use path from Surface tab", font=FONT, bg=BG_D,
+        tk.Button(lf, text="Use paths from Surface tab", font=FONT, bg=BG_D,
                   relief="flat", cursor="hand2",
                   command=self._copy_from_surface_tab)\
             .pack(side="left", padx=PAD)
@@ -1517,9 +1572,8 @@ class SurfaceCpTab(ScrollableFrame):
         self.parts_frame = tk.Frame(f, bg=BG)
         self.parts_frame.grid(row=r, column=0, columnspan=3, sticky="ew", padx=PAD)
         self.part_vars = {}
-        tk.Label(self.parts_frame, text="Click 'Load parts' to choose parts "
-                 "(all parts are used if none are loaded).",
-                 font=FONT_S, bg=BG, fg="#888").grid(row=0, column=0, sticky="w")
+        self._show_parts_msg("Parts load automatically from the Geometry .case when "
+                             "this tab opens (or click 'Load parts').")
         r += 1
         sel = tk.Frame(f, bg=BG)
         sel.grid(row=r, column=0, columnspan=3, sticky="w", padx=PAD)
@@ -1599,19 +1653,52 @@ class SurfaceCpTab(ScrollableFrame):
             self.v_scalar.set(keys[0])
 
     def _copy_from_surface_tab(self):
-        p = self.app.surface_tab.v_surface.get().strip()
-        if p:
-            self.v_surface.set(p)
-        else:
+        st = self.app.surface_tab
+        geom, surf = st.v_geom.get().strip(), st.v_surface.get().strip()
+        if not geom and not surf:
             messagebox.showinfo("Surface tab",
-                                "No surface data .case set in the Surface tab.")
+                                "No paths are set in the Surface tab.")
+            return
+        self.v_geom.set(geom)
+        self.v_surface.set(surf)
+        self._load_parts()
 
-    def _ensure_loaded(self, path):
+    def _paths(self, quiet=False):
+        """(surface_case or None, geom_case or None); None if neither is set."""
+        geom = self.v_geom.get().strip() or None
+        surf = self.v_surface.get().strip() or None
+        if not geom and not surf:
+            if not quiet:
+                messagebox.showwarning("Missing",
+                    "Set the Geometry .case (and optionally a Surface data .case).")
+            return None
+        return surf, geom
+
+    def auto_load(self):
+        """Load the part list when the tab opens, if the paths point at files."""
+        paths = self._paths(quiet=True)
+        if paths is None or self._busy:
+            return
+        if not all(os.path.isfile(p) for p in paths if p):
+            return
+        if self.part_vars and self._parts_path == paths:
+            return
+        self._load_parts()
+
+    def _show_parts_msg(self, text, fg="#888"):
+        for w in self.parts_frame.winfo_children():
+            w.destroy()
+        tk.Label(self.parts_frame, text=text, font=FONT_S, bg=BG, fg=fg,
+                 justify="left", wraplength=760)\
+            .grid(row=0, column=0, columnspan=3, sticky="w")
+
+    def _ensure_loaded(self, surf, geom):
         """Load (or reuse) the full-node surface. Runs in a worker thread."""
         import surface_cp as sc
-        if self._parts is None or self._parts_path != path:
-            self._parts = sc.load_surface(path)
-            self._parts_path = path
+        key = (surf, geom)
+        if self._parts is None or self._parts_path != key:
+            self._parts = sc.load_surface(surf, geom)
+            self._parts_path = key
         return self._parts
 
     def _populate_parts(self, parts):
@@ -1619,6 +1706,9 @@ class SurfaceCpTab(ScrollableFrame):
             w.destroy()
         old = {k: v.get() for k, v in self.part_vars.items()}
         self.part_vars = {}
+        if not parts:
+            self._show_parts_msg("No parts found — see the Log tab.", ERR_FG)
+            return
         for i, p in enumerate(parts):
             v = tk.BooleanVar(value=old.get(p['name'], True))
             self.part_vars[p['name']] = v
@@ -1628,25 +1718,28 @@ class SurfaceCpTab(ScrollableFrame):
                 .grid(row=i // 3, column=i % 3, sticky="w", padx=PAD_SM, pady=1)
 
     def _load_parts(self):
-        path = self.v_surface.get().strip()
-        if not path:
-            messagebox.showwarning("Missing", "Set the surface data .case path."); return
+        paths = self._paths()
+        if paths is None:
+            return
         if self._busy:
             return
         self._busy = True
-        self.load_lbl.config(text="Loading...", fg=ACCENT)
+        self.load_lbl.config(text="Loading parts...", fg=ACCENT)
+        self._show_parts_msg("Loading parts...", ACCENT)
 
         def _worker():
             try:
-                parts = self._ensure_loaded(path)
+                parts = self._ensure_loaded(*paths)
                 n = sum(p['mesh'].n_cells for p in parts)
                 self.app.ui(lambda: (self._populate_parts(parts),
                                        self.load_lbl.config(
                                            text=f"{len(parts)} parts · {n:,} cells",
                                            fg=OK_FG)))
             except Exception as exc:
-                self.app.ui(lambda: self.load_lbl.config(
-                    text="Error — see Log tab", fg=ERR_FG))
+                msg = str(exc)
+                self.app.ui(lambda: (self.load_lbl.config(
+                    text="Error — see Log tab", fg=ERR_FG),
+                    self._show_parts_msg(f"Could not load parts: {msg}", ERR_FG)))
                 print(f"\n[ERROR] {exc}")
                 import traceback; traceback.print_exc()
             finally:
@@ -1655,10 +1748,10 @@ class SurfaceCpTab(ScrollableFrame):
 
     def _run(self):
         import surface_cp as sc
-        path = self.v_surface.get().strip()
+        paths = self._paths()
         out  = self.v_out.get().strip()
-        if not path:
-            messagebox.showwarning("Missing", "Set the surface data .case path."); return
+        if paths is None:
+            return
         if not out:
             messagebox.showwarning("Missing", "Set the output directory."); return
         try:
@@ -1697,7 +1790,7 @@ class SurfaceCpTab(ScrollableFrame):
 
         def _worker():
             try:
-                parts = self._ensure_loaded(path)
+                parts = self._ensure_loaded(*paths)
                 if not self.part_vars:
                     self.app.ui(lambda: self._populate_parts(parts))
                 files = sc.export_sections(parts, axis, positions, skey, out, **opts)
@@ -1756,10 +1849,12 @@ class App(tk.Tk):
         self.notebook.add(self.compare_tab,    text="  Compare  ")
         self.notebook.add(self.surface_tab,    text="  Surface  ")
         self.notebook.add(self.surface_cp_tab, text="  Surface Cp  ")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self.notebook.add(self.settings_tab,   text="  Settings  ")
         self.notebook.add(self.log_tab,        text="  Log  ")
 
         redir = LogRedirector(self.log_tab.log_text, sys.stdout)
+        self._log_redir = redir
         sys.stdout = redir
 
         # Worker threads hand UI updates to the main thread through a queue
@@ -1776,11 +1871,21 @@ class App(tk.Tk):
                  fg="#999", anchor="e")            .pack(side="right", padx=PAD)
 
 
+    def _on_tab_changed(self, _event=None):
+        try:
+            if self.notebook.select() == str(self.surface_cp_tab):
+                self.surface_cp_tab.auto_load()
+        except Exception as exc:
+            print(f"[ui] {exc}")
+
     def ui(self, fn):
         """Run fn() on the Tk main thread (safe to call from worker threads)."""
         self._ui_queue.put(fn)
 
     def _pump_ui(self):
+        redir = getattr(self, '_log_redir', None)
+        if redir is not None:
+            redir.drain()
         try:
             while True:
                 fn = self._ui_queue.get_nowait()

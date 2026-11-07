@@ -23,7 +23,7 @@ gridded.
 
 Functions
 ---------
-load_surface(surface_case)            -> list of {name, mesh}
+load_surface(surface_case, geom_case) -> list of {name, mesh}  (geometry parts only)
 parse_positions("100, 250, 400:800:100") -> [100, 250, 400, ..., 800]  (mm)
 section(parts, axis, pos_m, scalar_key, part_names=None)
                                       -> list of curve dicts
@@ -53,30 +53,77 @@ PART_COLOURS = ['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#E69F00',
 #  LOADING
 # ══════════════════════════════════════════════════════════════════
 
-def load_surface(surface_case):
+def load_surface(surface_case=None, geom_case=None):
     """
-    Load every non-empty block of the CFD surface .case as PolyData.
-    No geometry, no mapping — the native CFD surface mesh.
+    Load the surface parts to slice — the geometry's parts, as PolyData.
+
+    geom_case    : geometry .case. Its parts are the parts listed and sliced,
+                   always — whatever is (or is not) in the surface file.
+    surface_case : optional .case with the surface Cp/Cf. Each geometry part
+                   takes its data from the matching block here (by name, or
+                   by position when the bounding boxes agree). Parts with no
+                   match — or every part, when the file holds only plane
+                   sections such as Raw_Data.case — use the Cp/Cf stored in
+                   the geometry .case itself (UT26 Geometry.case carries it).
+    With no geom_case, the non-plane blocks of surface_case are used.
+    Plane sections (X_Planes, ...) are never sliced.
     """
     import pyvista as pv
+    import io_utils
+    import surface_render as sr
     pv.global_theme.allow_empty_mesh = True
     t0 = time.perf_counter()
-    import io_utils
-    print(f"[surface_cp] Loading surface data (full nodes): {surface_case}")
-    io_utils.check_case(surface_case, 'Surface data')
-    mb = pv.read(surface_case)
-    if not isinstance(mb, pv.MultiBlock):
-        mb = pv.MultiBlock([mb])
+    if not (surface_case or geom_case):
+        raise FileNotFoundError("Set the Geometry .case (or a Surface data .case).")
+    same = bool(surface_case and geom_case and
+                os.path.abspath(surface_case) == os.path.abspath(geom_case))
+
+    if geom_case:
+        print(f"[surface_cp] Loading geometry parts: {geom_case}")
+        io_utils.check_case(geom_case, 'Geometry')
+        geom_parts = sr._blocks(pv.read(geom_case))
+        matched = {}
+        if surface_case and not same:
+            print(f"[surface_cp] Loading surface data (full nodes): {surface_case}")
+            io_utils.check_case(surface_case, 'Surface data')
+            surf_parts = sr._blocks(pv.read(surface_case))
+            matched, skipped = sr.match_to_geometry(geom_parts, surf_parts)
+            if skipped:
+                print(f"  not geometry parts — not sliced: {skipped}")
+            if not matched:
+                print("  [NOTE] the Surface data .case has no geometry parts "
+                      "(plane sections such as Raw_Data.case are not surface "
+                      "data) — using the Cp/Cf stored in the Geometry .case.")
+        else:
+            print("  using the surface data stored in the geometry .case")
+        keep = [(gi, name, matched.get(gi, g), gi in matched)
+                for gi, name, g in geom_parts]
+    else:
+        print(f"[surface_cp] Loading surface data (full nodes): {surface_case}")
+        io_utils.check_case(surface_case, 'Surface data')
+        keep = [(i, n, b, True) for i, n, b in sr._blocks(pv.read(surface_case))]
+
+    planes = [n for _, n, _, _ in keep if sr.PLANE_NAME_RE.search(n)]
+    if planes:
+        print(f"  plane sections — not sliced: {planes}")
+        keep = [k for k in keep if k[1] not in planes]
+
     parts = []
-    for i in range(mb.n_blocks):
-        b = mb[i]
-        if b is None or b.n_cells == 0:
-            continue
-        name = (mb.get_block_name(i) or f"Part {i}").strip()
+    for i, name, b, from_surf in keep:
         mesh = b if isinstance(b, pv.PolyData) else \
             b.extract_surface(algorithm='dataset_surface')
+        has = [k for k in list(mesh.cell_data.keys()) + list(mesh.point_data.keys())
+               if not k.startswith('vtkOriginal')]
+        tag = ("surface data file" if (from_surf and geom_case) else
+               "geometry .case data" if has else "no surface data")
         parts.append(dict(name=name, mesh=mesh))
-        print(f"  {name}: {mesh.n_cells:,} cells")
+        print(f"  {name}: {mesh.n_cells:,} cells  ({tag})")
+    if not parts:
+        src = geom_case or surface_case
+        raise ValueError(
+            f"No geometry parts found in {os.path.basename(src)} — it only "
+            f"holds plane sections ({', '.join(planes) or 'nothing else'}). "
+            f"Set the Geometry .case to the geometry export (e.g. Geometry.case).")
     print(f"[surface_cp] {len(parts)} parts in {time.perf_counter()-t0:.1f}s")
     return parts
 

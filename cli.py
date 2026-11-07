@@ -15,7 +15,7 @@ Usage
 -----
   python cli.py run   [options]
   python cli.py compare DIR_A DIR_B [options]
-  python cli.py surfcp SURFACE_CASE --axis Y --pos 0:600:150 [options]
+  python cli.py surfcp GEOMETRY_OR_SURFACE_CASE --axis Y --pos 0:600:150 [options]
   python cli.py info  NPZ_PATH [options]
   python cli.py list  NPZ_ROOT [options]
 
@@ -52,11 +52,15 @@ Compare examples
 
 Surface Cp along slices
 -----------------------
-  # Cp vs X on Y-slices at 0, 150, 300, 450, 600 mm (PNG + CSV each)
-  python cli.py surfcp path/to/Surface.case --axis Y --pos 0:600:150 --out out/
+  # Cp vs X on Y-slices at 0, 150, 300, 450, 600 mm (PNG + CSV each),
+  # using the Cp/Cf stored in Geometry.case (plane sections are skipped)
+  python cli.py surfcp path/to/Geometry.case --axis Y --pos 0:600:150 --out out/
+
+  # Separate surface export, keep only the geometry parts
+  python cli.py surfcp Surface.case --geom Geometry.case --axis Y --pos 300
 
   # Front wing only, zoomed
-  python cli.py surfcp Surface.case --axis Y --pos 300 --parts "Front wing" \\
+  python cli.py surfcp Geometry.case --axis Y --pos 300 --parts "Front wing" \\
                        --hlim -1.0 -0.55
 
 Info / list
@@ -116,7 +120,7 @@ def cmd_compare(args):
 
 def cmd_surfcp(args):
     import surface_cp as sc
-    parts = sc.load_surface(args.surface_case)
+    parts = sc.load_surface(args.surface_case, args.geom)
     sc.export_sections(
         parts, args.axis, sc.parse_positions(' '.join(args.pos)),
         args.scalar, args.out or cfg.OUTPUT_DIR or '.',
@@ -227,7 +231,10 @@ def build_parser():
     # ── surfcp ────────────────────────────────────────────────────
     p_scp = sub.add_parser('surfcp',
                            help='Surface Cp (or Cf) along slices — PNG + CSV')
-    p_scp.add_argument('surface_case', metavar='SURFACE_CASE')
+    p_scp.add_argument('surface_case', metavar='SURFACE_CASE',
+                       help='.case with surface Cp/Cf (e.g. Geometry.case)')
+    p_scp.add_argument('--geom', metavar='PATH',
+                       help='Geometry .case: only its parts are sliced')
     p_scp.add_argument('--axis', choices=['X', 'Y', 'Z'], default='Y')
     p_scp.add_argument('--pos', nargs='+', required=True, metavar='MM',
                        help='Positions in mm: list and/or start:stop:step')

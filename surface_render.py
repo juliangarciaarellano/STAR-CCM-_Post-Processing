@@ -15,8 +15,10 @@ Renders CFD surface data on the CFD surface mesh itself — full nodes.
 Every output (PNG views, per-part views, 3D export, interactive HTML) uses
 the native CFD surface cells with their exact values: no nearest-cell
 mapping onto the CAD geometry, no decimation, no cell->point averaging.
-The geometry .case only supplies part names and a grey fallback for parts
-that have no surface data.
+Only the parts of the geometry .case are drawn: surface-data blocks are
+matched to them by name (plane sections and other non-geometry blocks are
+skipped). With no separate surface file, the Cp/Cf stored in the geometry
+.case is used.
 
 Functions
 ---------
@@ -56,6 +58,7 @@ VIEWS
 """
 
 import os
+import re
 import time
 import numpy as np
 import pyvista as pv
@@ -118,6 +121,40 @@ def make_cp_cmap(mute=0.0, vmin=-4.0, vmax=1.0):
     return mcolors.ListedColormap(lut, name='cp_surface_muted')
 
 
+def color_bands():
+    """Number of solid colour bands for surface plots (0 = smooth)."""
+    try:
+        n = int(getattr(cfg, 'SURFACE_COLOR_BANDS', 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return n if n >= 2 else 0
+
+
+def banded_cmap(cmap, n=None):
+    """
+    cmap -> n solid colours evenly spread over it (like STAR-CCM+'s
+    'Number of colors'). The first and last band keep the end colours.
+    n=None uses SURFACE_COLOR_BANDS; 0 returns the smooth map unchanged.
+    """
+    n = color_bands() if n is None else n
+    if isinstance(cmap, str):
+        import matplotlib
+        cmap = matplotlib.colormaps[cmap]
+    if not n or getattr(cmap, '_pp_bands', None) == n:
+        return cmap
+    out = mcolors.ListedColormap(cmap(np.linspace(0, 1, n)),
+                                 name=f'{cmap.name}_{n}bands')
+    out.set_under(cmap(0.0)); out.set_over(cmap(1.0)); out.set_bad((0, 0, 0, 0))
+    out._pp_bands = n
+    return out
+
+
+def _lut_args(cmap):
+    """add_mesh colour arguments: banded map + one LUT entry per band."""
+    n = color_bands()
+    return dict(cmap=banded_cmap(cmap), n_colors=n if n else 256)
+
+
 def _find_array(mesh, name):
     """('cell'|'point', array_name) for an exact or partial array match."""
     for where, data in (('cell', mesh.cell_data), ('point', mesh.point_data)):
@@ -134,7 +171,7 @@ def _colorbar(fig, ax, cmap, clim, label=None):
     import matplotlib.pyplot as plt
     import matplotlib.colors as mc
     import plotting
-    sm = plt.cm.ScalarMappable(cmap=cmap,
+    sm = plt.cm.ScalarMappable(cmap=banded_cmap(cmap),
                                norm=mc.Normalize(vmin=clim[0], vmax=clim[1]))
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02)
@@ -145,82 +182,127 @@ def _colorbar(fig, ax, cmap, clim, label=None):
     return cbar
 
 
+# ── Geometry-only part matching ──────────────────────────────────
+PLANE_NAME_RE = re.compile(r'plane|section|slice', re.IGNORECASE)
+
+
+def _norm_name(n):
+    return ' '.join(str(n or '').lower().split())
+
+
+def _blocks(mb):
+    """[(index, name, block)] for every non-empty block of a MultiBlock."""
+    if not isinstance(mb, pv.MultiBlock):
+        mb = pv.MultiBlock([mb])
+    out = []
+    for i in range(mb.n_blocks):
+        b = mb[i]
+        if b is not None and b.n_cells > 0:
+            out.append((i, (mb.get_block_name(i) or f"Part {i}").strip(), b))
+    return out
+
+
+def _bounds_match(a, b, tol=0.05):
+    """True if two bounding boxes agree within tol x the part size."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    size = max(float(np.max(a[1::2] - a[0::2])), 1e-3)
+    return bool(np.all(np.abs(a - b) <= tol * size))
+
+
+def match_to_geometry(geom_parts, surf_parts):
+    """
+    Pair surface-data blocks with geometry parts.
+
+    1. by part name (case / spacing ignored)
+    2. by block position, only if the bounding boxes agree — so plane
+       sections or any other non-geometry block are never picked up.
+
+    Returns ({geom_index: surface_block}, [names of skipped surface blocks]).
+    """
+    by_name = {}
+    for i, n, b in surf_parts:
+        by_name.setdefault(_norm_name(n), (i, n, b))
+    used, result = set(), {}
+    for gi, gn, gb in geom_parts:
+        hit = by_name.get(_norm_name(gn))
+        if hit and hit[0] not in used:
+            result[gi] = hit[2]; used.add(hit[0])
+    by_index = {i: (i, n, b) for i, n, b in surf_parts}
+    for gi, gn, gb in geom_parts:
+        if gi in result:
+            continue
+        cand = by_index.get(gi)
+        if (cand and cand[0] not in used and not PLANE_NAME_RE.search(cand[1])
+                and _bounds_match(gb.bounds, cand[2].bounds)):
+            result[gi] = cand[2]; used.add(cand[0])
+    skipped = [n for i, n, b in surf_parts if i not in used]
+    return result, skipped
+
+
 # ── Core preparation ──────────────────────────────────────────────
 def prepare_surfaces(geom_case, surface_case=None, scalars=None,
                      feature_angle=25):
     """
-    Load the CFD surface mesh (full nodes) and the geometry part names.
+    Build the surfaces to draw — ONLY the parts of the geometry .case.
 
-    Parameters
-    ----------
-    geom_case    : str   path to geometry .case file (part names + fallback)
-    surface_case : str or None   path to surface CFD .case file
-                   If None, renders geometry only (no scalar colouring).
-    scalars      : list of str or None   which arrays to keep
-                   defaults to all available in surface_case
-    feature_angle: float   angle threshold for feature edge extraction
+    Surface data comes from the full-node CFD surface blocks that match a
+    geometry part (by name, or by position when the bounding boxes agree).
+    Blocks that are not geometry parts — plane sections such as X_Planes,
+    or anything else in the surface file — are skipped and listed.
+
+    surface_case None (or the geometry .case itself): use the Cp/Cf stored
+    in the geometry .case, if it has any.
 
     Returns
     -------
-    list of dicts, one per part:
+    list of dicts, one per geometry part:
         name    : str
-        surf    : pyvista PolyData   CFD surface, native cells + cell_data
+        surf    : pyvista PolyData   native cells + cell_data
         edges   : pyvista PolyData or None   feature edges
-        source  : 'cfd' (full-node CFD surface) or 'geometry' (no data)
+        source  : 'cfd' (surface data file) | 'geometry' (geometry .case)
     """
     import io_utils
     t0 = time.perf_counter()
     print("[surface_render] Loading geometry...")
     io_utils.check_case(geom_case, 'Geometry')
-    geom = pv.read(geom_case)
+    geom_parts = _blocks(pv.read(geom_case))
 
-    surf_mesh = None
-    scalars_to_use = []
-    if surface_case is not None:
+    same = (surface_case is not None and
+            os.path.abspath(surface_case) == os.path.abspath(geom_case))
+    matched = {}
+    if surface_case is not None and not same:
         print("[surface_render] Loading surface data (full nodes)...")
         io_utils.check_case(surface_case, 'Surface data')
-        surf_mesh = pv.read(surface_case)
+        surf_parts = _blocks(pv.read(surface_case))
+        matched, skipped = match_to_geometry(geom_parts, surf_parts)
+        if skipped:
+            print(f"  not geometry parts — not drawn: {skipped}")
+        if not matched:
+            print("  [WARN] none of the parts in the Surface data .case match "
+                  "the geometry parts — using the geometry .case's own data. "
+                  "(Plane sections such as Raw_Data.case are not surface data; "
+                  "leave Surface data empty to use the Cp/Cf in Geometry.case.)")
+    else:
+        print("[surface_render] Using the surface data stored in the "
+              "geometry .case")
 
-        available = set()
-        for i in range(surf_mesh.n_blocks):
-            b = surf_mesh[i]
-            if b is not None and b.n_cells > 0:
-                available.update(b.cell_data.keys())
-                available.update(b.point_data.keys())
-        scalars_to_use = scalars if scalars else sorted(available)
-        print(f"[surface_render] Scalars: {scalars_to_use}")
-
-    print("[surface_render] Preparing surfaces (full nodes, no interpolation)...")
+    print("[surface_render] Preparing surfaces (geometry parts only, "
+          "full nodes, no interpolation)...")
     prepared = []
-    n_blocks = geom.n_blocks
-    if surf_mesh is not None:
-        n_blocks = max(n_blocks, surf_mesh.n_blocks)
-
-    for i in range(n_blocks):
-        g = geom[i] if i < geom.n_blocks else None
-        s = (surf_mesh[i] if surf_mesh is not None and i < surf_mesh.n_blocks
-             else None)
-        has_g = g is not None and g.n_cells > 0
-        has_s = s is not None and s.n_cells > 0
-        if not has_g and not has_s:
-            continue
-        name = (geom.get_block_name(i) if has_g else
-                surf_mesh.get_block_name(i)) or f"Part {i}"
-        name = name.strip()
-
-        if has_s:
-            surf = s.extract_surface(algorithm='dataset_surface')
-            # keep only the requested arrays (plus nothing interpolated)
+    for gi, name, g in geom_parts:
+        s_block = matched.get(gi)
+        src = s_block if s_block is not None else g
+        surf = src.extract_surface(algorithm='dataset_surface')
+        if scalars:
             for k in list(surf.cell_data.keys()):
-                if k not in scalars_to_use:
+                if k not in scalars:
                     surf.cell_data.remove(k)
             for k in list(surf.point_data.keys()):
-                if k not in scalars_to_use:
+                if k not in scalars:
                     surf.point_data.remove(k)
-            source = 'cfd'
-        else:
-            surf = g.extract_surface(algorithm='dataset_surface')
-            source = 'geometry'
+        data = [k for k in list(surf.cell_data.keys()) + list(surf.point_data.keys())
+                if not k.startswith('vtkOriginal')]
+        source = 'cfd' if s_block is not None else 'geometry'
 
         edges = surf.extract_feature_edges(
             boundary_edges=True, feature_edges=True,
@@ -230,7 +312,8 @@ def prepare_surfaces(geom_case, surface_case=None, scalars=None,
         edges = edges if edges.n_cells > 0 else None
 
         prepared.append(dict(name=name, surf=surf, edges=edges, source=source))
-        tag = "full nodes" if source == 'cfd' else "geometry only, no data"
+        tag = ("surface data file, full nodes" if source == 'cfd' else
+               "geometry .case data" if data else "no surface data — grey")
         print(f"  {name}: {surf.n_cells:,} cells  ({tag})")
 
     prepared = _merge_parts(prepared, MERGE_GROUPS)
@@ -302,7 +385,7 @@ def _add_scalar_mesh(pl, surf, scalar_key, cmap, clim, part_name='?'):
     where, arr = _find_array(surf, scalar_key)
     if where is not None:
         pl.add_mesh(surf, scalars=arr, preference=where,
-                    cmap=cmap, clim=list(clim),
+                    clim=list(clim), **_lut_args(cmap),
                     smooth_shading=False, interpolate_before_map=False,
                     show_scalar_bar=False, lighting=False, show_edges=False)
         return True
@@ -314,9 +397,18 @@ def _add_scalar_mesh(pl, surf, scalar_key, cmap, clim, part_name='?'):
     return False
 
 
+def _set_projection(pl):
+    """Parallel (orthographic) or perspective, from config."""
+    if getattr(cfg, 'SURFACE_PARALLEL_PROJECTION', True):
+        pl.enable_parallel_projection()
+    else:
+        pl.disable_parallel_projection()
+
+
 def _fit_camera(pl, parts, pos, focal, up, wsize, target_fill=0.85):
     """Point the camera along the view direction and zoom to fill."""
     import vtk as _vtk
+    _set_projection(pl)
     pl.view_vector(vector=tuple(p - f for p, f in zip(pos, focal)), viewup=up)
     pl.reset_camera()
     all_bounds = np.array([p['surf'].bounds for p in parts])
@@ -363,9 +455,11 @@ def _render_one_view(parts, scalar_key, cmap, clim,
     if zoom:
         _fit_camera(pl, parts, pos, focal, up, wsize)
     else:
+        _set_projection(pl)
         pl.camera.position    = pos
         pl.camera.focal_point = focal
         pl.camera.view_up     = up
+        pl.reset_camera_clipping_range()
 
     img = pl.screenshot(None, return_img=True)
     pl.close()
@@ -633,7 +727,7 @@ def render_delta_views(prepared_a, prepared_b, scalar_key,
             if part['has_delta']:
                 pl.add_mesh(part['surf'], scalars='delta',
                             preference=part['where'],
-                            cmap='RdBu_r', clim=list(clim),
+                            clim=list(clim), **_lut_args('RdBu_r'),
                             smooth_shading=False,
                             interpolate_before_map=False,
                             show_scalar_bar=False,
@@ -728,6 +822,277 @@ def export_3d(prepared, scalar_keys=None, output_dir='.',
 
 
 # ── Interactive HTML export ───────────────────────────────────────
+
+
+# ── Interactive HTML — compact, lossless ─────────────────────────────────────
+#
+# Plotly's own HTML writer stores one entry per *triangle*: three int32
+# indices plus a float per triangle, uncompressed. STAR surfaces are mostly
+# hexagons (≈4 triangles each), so a full car came out at ~400 MB.
+#
+# Instead each part is stored as its CFD polygons (one value per cell),
+# delta + byte-shuffle encoded and deflated, then unpacked by the browser
+# when the page opens (DecompressionStream). Every node, every cell and every
+# value is kept exactly (float32, bit-for-bit) — the file is just ~5x smaller.
+# The browser splits each polygon into a triangle fan; the few concave
+# polygons where a plain fan would fold are rotated or ear-clipped here first.
+
+HTML_ZLIB_LEVEL = 6
+
+
+def _shuffle(a):
+    """Byte-shuffle: byte k of every element stored together (helps deflate)."""
+    a = np.ascontiguousarray(a)
+    b = a.view(np.uint8).reshape(-1, a.dtype.itemsize)
+    return np.ascontiguousarray(b.T).tobytes()
+
+
+def _delta_zz(a):
+    """int32 values -> zigzag-encoded deltas (uint32). Exactly reversible."""
+    d = np.diff(np.asarray(a, dtype=np.int64), prepend=0)
+    d = (d + 2**31) % 2**32 - 2**31                         # wrap to int32
+    return ((d << 1) ^ (d >> 31)).astype(np.uint32)
+
+
+def _fan(off, conn):
+    """Fan triangles (v0, vk, vk+1) for every polygon + owning polygon index."""
+    sizes = np.diff(off)
+    ntri  = sizes - 2
+    cell  = np.repeat(np.arange(len(sizes)), ntri)
+    k     = np.arange(len(cell)) - np.repeat(np.cumsum(ntri) - ntri, ntri)
+    st    = off[:-1][cell]
+    return np.stack([conn[st], conn[st + k + 1], conn[st + k + 2]], 1), cell
+
+
+def _newell(P):
+    """Area-weighted normal of a polygon (rows of P in order)."""
+    Q = np.roll(P, -1, axis=0)
+    return np.array([np.sum((P[:, 1] - Q[:, 1]) * (P[:, 2] + Q[:, 2])),
+                     np.sum((P[:, 2] - Q[:, 2]) * (P[:, 0] + Q[:, 0])),
+                     np.sum((P[:, 0] - Q[:, 0]) * (P[:, 1] + Q[:, 1]))])
+
+
+def _fan_ok(P, n):
+    """True if the fan from vertex 0 has no triangle facing against n."""
+    a = P[1:-1] - P[0]
+    b = P[2:] - P[0]
+    t = np.cross(a, b)
+    return bool(np.all(t @ n >= -1e-6 * np.linalg.norm(t, axis=1)
+                       * np.linalg.norm(n)))
+
+
+def _ear_clip(P, ids, n):
+    """Ear-clip one polygon (projected on its own plane) -> list of triangles."""
+    ax = int(np.argmax(np.abs(n)))
+    uv = np.delete(P, ax, axis=1)
+    if n[ax] < 0:
+        uv[:, 0] = -uv[:, 0]                       # make the polygon CCW
+    idx  = list(range(len(ids)))
+    tris = []
+
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+
+    guard = 0
+    while len(idx) > 3 and guard < 4 * len(ids) ** 2:
+        guard += 1
+        for m in range(len(idx)):
+            i0, i1, i2 = idx[m - 1], idx[m], idx[(m + 1) % len(idx)]
+            A, B, C = uv[i0], uv[i1], uv[i2]
+            if cross(A, B, C) <= 0:
+                continue                           # reflex corner
+            if any(cross(A, B, uv[q]) >= 0 and cross(B, C, uv[q]) >= 0
+                   and cross(C, A, uv[q]) >= 0
+                   for q in idx if q not in (i0, i1, i2)):
+                continue                           # another vertex inside
+            tris.append((ids[i0], ids[i1], ids[i2]))
+            idx.pop(m)
+            break
+        else:
+            break                                  # degenerate: fan the rest
+    for q in range(1, len(idx) - 1):
+        tris.append((ids[idx[0]], ids[idx[q]], ids[idx[q + 1]]))
+    return tris
+
+
+def _html_polygons(surf, pts64):
+    """
+    Polygons of a surface, ready for a browser-side fan split.
+    Returns (sizes, conn, src, n_rot, n_clip): src[i] is the original
+    polygon index each output polygon takes its value from.
+    """
+    from vtk.util.numpy_support import vtk_to_numpy
+    off  = vtk_to_numpy(surf.GetPolys().GetOffsetsArray()).astype(np.int64)
+    conn = vtk_to_numpy(surf.GetPolys().GetConnectivityArray()).astype(np.int64)
+    sizes = np.diff(off)
+    src   = np.arange(len(sizes))
+
+    keep = sizes >= 3                              # lines/points draw nothing
+    if not keep.all():
+        conn  = conn[np.repeat(keep, sizes)]
+        sizes, src = sizes[keep], src[keep]
+        off = np.r_[0, np.cumsum(sizes)]
+
+    F, cell = _fan(off, conn)
+    t  = np.cross(pts64[F[:, 1]] - pts64[F[:, 0]], pts64[F[:, 2]] - pts64[F[:, 0]])
+    nc = np.stack([np.bincount(cell, t[:, c], len(sizes)) for c in range(3)], 1)
+    d  = np.einsum('ij,ij->i', t, nc[cell])
+    bad_t = d < -1e-6 * np.linalg.norm(t, axis=1) * np.linalg.norm(nc[cell], axis=1)
+    bad = np.unique(cell[bad_t])
+
+    n_rot = 0
+    clip_cells, clip_tris = [], []
+    for c in bad:
+        a, b = off[c], off[c + 1]
+        ids = conn[a:b].copy()
+        P   = pts64[ids]
+        n   = _newell(P)
+        for r in range(1, len(ids)):
+            if _fan_ok(np.roll(P, -r, axis=0), n):
+                conn[a:b] = np.roll(ids, -r)       # same polygon, new start
+                n_rot += 1
+                break
+        else:
+            clip_cells.append(c)
+            clip_tris.append(_ear_clip(P, ids, n))
+
+    if clip_cells:
+        drop = np.zeros(len(sizes), bool)
+        drop[clip_cells] = True
+        conn = conn[~np.repeat(drop, sizes)]
+        extra_src = [src[c] for c, tl in zip(clip_cells, clip_tris) for _ in tl]
+        extra_con = [v for tl in clip_tris for tri in tl for v in tri]
+        sizes = np.r_[sizes[~drop], np.full(len(extra_src), 3)]
+        src   = np.r_[src[~drop], np.asarray(extra_src, np.int64)]
+        conn  = np.r_[conn, np.asarray(extra_con, np.int64)]
+    return sizes, conn, src, n_rot, len(clip_cells)
+
+
+def _encode_part(surf, where, arr):
+    """Pack one part -> (base64 text, meta dict, number of triangles)."""
+    import base64
+    import zlib
+    if not isinstance(surf, pv.PolyData):
+        surf = surf.extract_surface()
+    if surf.n_strips:
+        surf = surf.triangulate()
+
+    pts   = np.ascontiguousarray(surf.points, dtype=np.float32)
+    sizes, conn, src, n_rot, n_clip = _html_polygons(surf, pts.astype(np.float64))
+
+    if where == 'cell':
+        base = surf.n_verts + surf.n_lines        # polys follow verts + lines
+        vals = np.asarray(surf.cell_data[arr], np.float32)[base:][src]
+        mode = 'cell'
+    else:
+        vals = np.asarray(surf.point_data[arr], np.float32)
+        mode = 'vertex'
+
+    sw = 1 if sizes.max(initial=3) <= 255 else 2
+    streams = [_shuffle(_delta_zz(pts[:, c].copy().view(np.int32)))
+               for c in range(3)]
+    streams.append(sizes.astype(np.uint8).tobytes() if sw == 1
+                   else _shuffle(sizes.astype(np.uint16)))
+    streams.append(_shuffle(_delta_zz(conn)))
+    streams.append(_shuffle(np.ascontiguousarray(vals, np.float32)))
+
+    blob = zlib.compress(b''.join(streams), HTML_ZLIB_LEVEL)
+    meta = dict(n_pts=int(len(pts)), n_poly=int(len(sizes)),
+                n_conn=int(len(conn)), n_tri=int((sizes - 2).sum()),
+                sw=sw, mode=mode, lens=[len(s) for s in streams],
+                n_rot=n_rot, n_clip=n_clip)
+    return base64.b64encode(blob).decode('ascii'), meta
+
+
+_HTML_JS = r"""
+(async function () {
+  const status = document.getElementById('pp-status');
+  try {
+    if (typeof DecompressionStream === 'undefined')
+      throw new Error('this browser cannot unpack the data');
+    const META = JSON.parse(document.getElementById('pp-meta').textContent);
+    const FIG  = JSON.parse(document.getElementById('pp-fig').textContent);
+
+    const b64 = s => {
+      if (Uint8Array.fromBase64) return Uint8Array.fromBase64(s);
+      const bin = atob(s), u = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+      return u;
+    };
+    const inflate = async u8 => new Uint8Array(await new Response(
+      new Blob([u8]).stream().pipeThrough(new DecompressionStream('deflate'))
+    ).arrayBuffer());
+    const unshuffle = (src, off, n, w) => {
+      const out = new Uint8Array(n * w);
+      for (let k = 0; k < w; k++) {
+        const base = off + k * n;
+        for (let i = 0; i < n; i++) out[i * w + k] = src[base + i];
+      }
+      return out.buffer;
+    };
+    const undelta = buf => {
+      const u = new Uint32Array(buf), v = new Int32Array(buf);
+      let acc = 0;
+      for (let i = 0; i < u.length; i++) {
+        const x = u[i];
+        acc = (acc + ((x >>> 1) ^ -(x & 1))) | 0;
+        v[i] = acc;
+      }
+      return v;
+    };
+
+    for (let q = 0; q < META.length; q++) {
+      const p = META[q];
+      status.textContent = `Unpacking ${p.name} (${q + 1}/${META.length}) …`;
+      await new Promise(r => setTimeout(r, 0));
+      const el  = document.getElementById('pp-d' + q);
+      const raw = await inflate(b64(el.textContent.trim()));
+      el.textContent = '';
+      let o = 0;
+      const xyz = [];
+      for (let c = 0; c < 3; c++) {
+        xyz.push(new Float32Array(undelta(unshuffle(raw, o, p.n_pts, 4)).buffer));
+        o += p.lens[c];
+      }
+      const sizes = p.sw === 1 ? raw.slice(o, o + p.n_poly)
+                               : new Uint16Array(unshuffle(raw, o, p.n_poly, 2));
+      o += p.lens[3];
+      const conn = undelta(unshuffle(raw, o, p.n_conn, 4));
+      o += p.lens[4];
+      const cell = p.mode === 'cell';
+      const vals = new Float32Array(unshuffle(raw, o, cell ? p.n_poly : p.n_pts, 4));
+
+      const I = new Int32Array(p.n_tri), J = new Int32Array(p.n_tri),
+            K = new Int32Array(p.n_tri);
+      const inten = cell ? new Float32Array(p.n_tri) : vals;
+      let t = 0, c0 = 0;
+      for (let a = 0; a < p.n_poly; a++) {
+        const n = sizes[a], v0 = conn[c0];
+        for (let m = 1; m < n - 1; m++) {
+          I[t] = v0; J[t] = conn[c0 + m]; K[t] = conn[c0 + m + 1];
+          if (cell) inten[t] = vals[a];
+          t++;
+        }
+        c0 += n;
+      }
+      Object.assign(FIG.data[q], {x: xyz[0], y: xyz[1], z: xyz[2],
+                                  i: I, j: J, k: K, intensity: inten});
+    }
+    status.textContent = 'Drawing …';
+    await new Promise(r => setTimeout(r, 0));
+    await Plotly.newPlot('pp-plot', FIG.data, FIG.layout, {responsive: true});
+    status.remove();
+    window.PP_READY = true;
+  } catch (e) {
+    status.textContent = 'Could not open this file: ' + e.message +
+      ' — use an up-to-date Chrome, Edge, Firefox or Safari (internet needed for plotly.js).';
+    status.style.color = '#b00';
+    window.PP_ERROR = String(e);
+  }
+})();
+"""
+
+
 def export_interactive_html(prepared, scalar_key, cmap=None,
                             clim=(-4.0, 1.0), label='Cp',
                             output_path='surface.html'):
@@ -735,9 +1100,10 @@ def export_interactive_html(prepared, scalar_key, cmap=None,
     Export an interactive Plotly 3D HTML file at full resolution.
 
     Every CFD surface cell is kept (no decimation) and coloured by its own
-    value (Plotly intensitymode='cell' — no cell->point averaging). Polygons
-    are split into triangles that each carry their parent cell's value.
-    Large surfaces give large files; the size is printed when done.
+    value (intensitymode='cell' — no cell->point averaging). The mesh is
+    stored compactly and losslessly (polygons + one value per cell, packed
+    and deflated) and unpacked by the browser when the page opens, so the
+    file is ~5x smaller than Plotly's default writer with identical data.
 
     Returns
     -------
@@ -745,21 +1111,31 @@ def export_interactive_html(prepared, scalar_key, cmap=None,
     """
     try:
         import plotly.graph_objects as go
+        import plotly.io as pio
     except ImportError:
         raise ImportError("plotly is required: pip install plotly")
+    import json
 
     if cmap is None:
         cmap = make_cp_cmap(vmin=clim[0], vmax=clim[1])
 
     vmin, vmax = clim
-    positions  = np.linspace(0, 1, 256)
-    rgba       = cmap(positions)
-    colorscale = [[float(p), f'rgb({int(round(r*255))},{int(round(g*255))},{int(round(b*255))})']
-                  for p, (r, g, b, _) in zip(positions, rgba)]
+    def _rgb(c):
+        return f'rgb({int(round(c[0]*255))},{int(round(c[1]*255))},{int(round(c[2]*255))})'
+    n_bands = color_bands()
+    if n_bands:                       # hard-edged bands: two stops per band
+        cols = banded_cmap(cmap, n_bands)(np.linspace(0, 1, n_bands))
+        colorscale = []
+        for k, c in enumerate(cols):
+            colorscale += [[k / n_bands, _rgb(c)], [(k + 1) / n_bands, _rgb(c)]]
+    else:
+        positions  = np.linspace(0, 1, 256)
+        colorscale = [[float(p), _rgb(c)] for p, c in zip(positions, cmap(positions))]
 
-    print("[surface_render] Building interactive HTML (full nodes, every cell)...")
-    traces = []
-    first  = True
+    print("[surface_render] Building interactive HTML (full nodes, every cell, "
+          "packed losslessly)...")
+    t_all  = time.perf_counter()
+    traces, metas, blobs = [], [], []
     n_total = 0
 
     for part in prepared:
@@ -770,30 +1146,11 @@ def export_interactive_html(prepared, scalar_key, cmap=None,
             continue
 
         t0 = time.perf_counter()
-        s = surf.copy()
-        for k in list(s.cell_data.keys()):
-            if k != arr:
-                s.cell_data.remove(k)
-        for k in list(s.point_data.keys()):
-            if k != arr:
-                s.point_data.remove(k)
-
-        tri   = s.triangulate()                    # cell data copied per triangle
-        pts   = np.asarray(tri.points, dtype=np.float32)
-        faces = tri.faces.reshape(-1, 4)[:, 1:].astype(np.int32)
-
-        if where == 'cell':
-            intensity = np.asarray(tri.cell_data[arr], dtype=np.float32)
-            imode = 'cell'
-        else:
-            intensity = np.asarray(tri.point_data[arr], dtype=np.float32)
-            imode = 'vertex'
-
-        trace = go.Mesh3d(
-            x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
-            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-            intensity=intensity,
-            intensitymode=imode,
+        text, meta = _encode_part(surf, where, arr)
+        meta['name'] = name
+        first = not traces
+        traces.append(go.Mesh3d(
+            intensitymode=meta['mode'],
             colorscale=colorscale,
             cmin=vmin, cmax=vmax,
             showscale=first,
@@ -808,12 +1165,18 @@ def export_interactive_html(prepared, scalar_key, cmap=None,
             hovertemplate=(f'<b>{name}</b><br>'
                            f'{label}: %{{intensity:.3f}}<extra></extra>'),
             showlegend=True,
-        )
-        traces.append(trace)
-        first = False
-        n_total += len(faces)
-        print(f"  {name}: {s.n_cells:,} cells -> {len(faces):,} tris  "
-              f"({time.perf_counter()-t0:.1f}s)")
+        ))
+        metas.append(meta)
+        blobs.append(text)
+        n_total += meta['n_tri']
+        fix = ''
+        if meta['n_rot'] or meta['n_clip']:
+            fix = f"  [{meta['n_rot']} concave cells re-fanned, {meta['n_clip']} ear-clipped]"
+        print(f"  {name}: {surf.n_cells:,} cells -> {meta['n_tri']:,} tris, "
+              f"{len(text)/1e6:.1f}MB  ({time.perf_counter()-t0:.1f}s){fix}")
+
+    if not traces:
+        raise ValueError(f"No part carries '{scalar_key}' — nothing to export.")
 
     fig = go.Figure(data=traces)
     fig.update_layout(
@@ -830,7 +1193,10 @@ def export_interactive_html(prepared, scalar_key, cmap=None,
             zaxis=dict(title='Z (m)', backgroundcolor='#f8f8f8',
                        gridcolor='#ddd', showbackground=True),
             aspectmode='data',
-            camera=dict(eye=dict(x=-1.2, y=-1.2, z=0.7)),
+            camera=dict(eye=dict(x=-1.2, y=-1.2, z=0.7),
+                        projection=dict(type='orthographic'
+                                        if getattr(cfg, 'SURFACE_PARALLEL_PROJECTION', True)
+                                        else 'perspective')),
         ),
         paper_bgcolor='white',
         legend=dict(x=0.01, y=0.99,
@@ -841,11 +1207,41 @@ def export_interactive_html(prepared, scalar_key, cmap=None,
         margin=dict(l=0, r=0, t=40, b=0),
     )
 
+    def _safe(s):                     # JSON inside <script>: never close the tag
+        return s.replace('</', '<\\/')
+
+    try:
+        from plotly.io._utils import plotly_cdn_url
+        cdn = plotly_cdn_url()
+    except Exception:
+        from plotly.offline import get_plotlyjs_version
+        cdn = f"https://cdn.plot.ly/plotly-{get_plotlyjs_version()}.min.js"
+
+    title = f"Surface {label} — interactive"
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    fig.write_html(output_path, include_plotlyjs='cdn')
+    with open(output_path, 'w', encoding='utf-8') as fh:
+        fh.write('<!DOCTYPE html>\n<html><head><meta charset="utf-8">\n'
+                 f'<title>{title}</title>\n'
+                 f'<script src="{cdn}" charset="utf-8"></script>\n'
+                 '<style>body{margin:0;font-family:sans-serif;background:#fff}'
+                 '#pp-status{padding:12px 16px;color:#444;font-size:14px}</style>\n'
+                 '</head><body>\n'
+                 '<div id="pp-status">Unpacking surface data …</div>\n'
+                 '<div id="pp-plot"></div>\n')
+        fh.write('<script type="application/json" id="pp-meta">'
+                 + _safe(json.dumps(metas)) + '</script>\n')
+        fh.write('<script type="application/json" id="pp-fig">'
+                 + _safe(pio.to_json(fig, validate=False)) + '</script>\n')
+        for q, text in enumerate(blobs):
+            fh.write(f'<script type="application/octet-stream" id="pp-d{q}">')
+            fh.write(text)
+            fh.write('</script>\n')
+        fh.write('<script>' + _HTML_JS + '</script>\n</body></html>\n')
+
     size_mb = os.path.getsize(output_path) / 1e6
     print(f"[surface_render] Saved interactive HTML -> {output_path}  "
-          f"({size_mb:.1f}MB, {n_total:,} triangles)")
+          f"({size_mb:.1f}MB, {n_total:,} triangles, "
+          f"{time.perf_counter()-t_all:.1f}s)")
     if size_mb > 200:
         print("  [NOTE] Large file — very big HTML files can be slow to open "
               "in a browser. Chrome/Edge handle them best.")
